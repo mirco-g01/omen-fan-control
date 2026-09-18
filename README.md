@@ -1,5 +1,16 @@
 # HP Omen Fan Control (Linux)
 
+> **Fork notice.** This is a fork of [arfelious/omen-fan-control](https://github.com/arfelious/omen-fan-control)
+> by [arfelious](https://github.com/arfelious), who did the original work (driver patch backport, calibration,
+> curve editor, GUI and CLI). All credit for the base tool goes to them. The original code is
+> Copyright © 2026 arfelious and is released under the GNU GPL v3; this fork keeps the same
+> license (see [LICENSE.md](LICENSE.md)). Changes made in this fork (Copyright © 2026 Mirco Giorgi) are
+> listed in [Changes in this fork](#changes-in-this-fork).
+>
+> This fork is based on upstream commit `0ba2bc6` (2026-03-07). Upstream has since moved on to
+> v2.0.0 with a new `src/` package layout, fan cleaning, GPU-temperature curves and packaging;
+> those changes are **not** included here.
+
 This tool provides fan control for HP Omen Max, Victus and Omen laptops on Linux. It includes installer for a kernel driver patch (`hp-wmi`) to expose PWM controls and a userspace utility to manage fan curves, create watchdog that sets the fan configuration periodically and a simple stress test tool to see the fan curve in effect.
 
 ## Context
@@ -108,6 +119,20 @@ python omen_cli.py settings
 sudo python3 omen_cli.py options --ma-window 10 --curve-interpolation smooth
 ```
 
+**Curve Temperature Source (`--temp-source`):**
+
+On Intel CPUs the `Package id 0` sensor is the *hottest* core, not an average. A single core
+boosting for a fraction of a second (e.g. a file indexer) hits Tjmax immediately, and a moving
+average of that reading keeps the fans spinning even though the CPU is barely loaded.
+```bash
+# package   - hottest core, the original behaviour (default)
+# core_mean - average of all core sensors
+# hybrid    - core_mean, plus the package reading once it has stayed hot for
+#             --spike-window consecutive samples (2s each); short bursts are ignored
+sudo python3 omen_cli.py options --temp-source hybrid --spike-window 15
+```
+The same setting is available in the GUI under *Options → Curve Temperature*.
+
 **Manual Fan Control:**
 ```bash
 # Set specific speed
@@ -122,9 +147,21 @@ sudo python3 omen_cli.py fan-control --mode auto
 
 **Using Custom Curves:**
 ```bash
-sudo python3 omen_cli.py fan-control --curve-csv my_curve.csv
+sudo python3 omen_cli.py fan-control --curve-csv my_curve.csv --curve-name Quiet
 ```
-Where the csv file has values in `temp, percent` order
+Where the csv file has values in `temp, percent` order. Without `--curve-name` the CSV replaces the active curve.
+
+**Curve library:** several named curves can be kept and switched at any time (the service
+picks the change up within a couple of seconds). The GUI has the same controls above the curve editor.
+```bash
+sudo python3 omen_cli.py curves list            # * marks the active curve
+sudo python3 omen_cli.py curves use Quiet
+sudo python3 omen_cli.py curves rename Quiet Silent
+sudo python3 omen_cli.py curves export Silent --csv silent.csv
+sudo python3 omen_cli.py curves delete Silent
+```
+Note: *Auto* mode is not a curve of this program: it hands the fans back to the firmware's own
+fan table (the one BIOS/Windows use), which cannot be read or edited.
 
 <br>
 
@@ -134,6 +171,28 @@ Commands provide detailed information when `--help` is passed with the command
 ```bash
 python omen_cli.py fan-control --help
 ```
+
+## Changes in this fork
+
+Tested on an HP Omen Max 16 (board `8D41`, Intel Core Ultra 7 255HX) running Arch Linux.
+
+- **Hybrid curve temperature** (`--temp-source`, GUI *Options → Curve Temperature*). On Intel the
+  `Package id 0` sensor is the hottest core: a single core boosting for a fraction of a second
+  (e.g. a file indexer) reaches Tjmax and a moving average of that reading kept the fans at 4000+ RPM
+  on an almost idle machine. `hybrid` controls on the mean of all cores and only lets the package
+  reading count once it has stayed hot for `--spike-window` samples. Same load: 600–900 RPM.
+- The header temperature in the GUI is now the temperature the curve is actually applied to.
+- **Named curve library**: several curves, switchable from the GUI (combo above the editor) or with
+  `omen_cli.py curves list|use|rename|delete|export`; the service follows the change within 2 s.
+- The curve step (temperature estimate + hysteresis) is shared between the daemon and the GUI's
+  local loop instead of being implemented twice.
+- Fixes: CLI options given without a value (`--bypass-warning`, `--curve-interpolation`, …) crashed
+  with *'show' is not one of…*; `--enable-experimental` / `--thermal-profile` were ignored; the
+  GUI showed the *Experimental Support* dialog on every start (`debug_experimental_ui` defaulted
+  to `true`); the Mode combo and manual speed did not reflect the saved config; missing window icon;
+  timers not stopped on close.
+- `hp-wmi.c`: don't abort module load when another driver (e.g. `omen-rgb-keyboard`) already owns
+  the WMI hotkey event handler; BIOS/fan/thermal features are independent of it.
 
 ## Uninstallation
 

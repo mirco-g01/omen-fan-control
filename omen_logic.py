@@ -2,6 +2,8 @@ import os
 # Omen Fan Control
 # Control your HP Laptop's fans in Linux
 # Copyright (C) 2026 arfelious
+# Modified 2026-09-18 by Mirco Giorgi (https://github.com/mirco-g01):
+#   hybrid temperature source, named curve library, GUI/CLI fixes
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -36,6 +38,18 @@ else:
 CONFIG_FILE = CONFIG_DIR / "config.json"
 DEFAULT_CALIBRATION_WAIT = 30
 DEFAULT_WATCHDOG_INTERVAL = 90
+# Which temperature the fan curve is applied to:
+#   package   - hottest core (Intel "Package id 0"), upstream behaviour
+#   core_mean - average of all core sensors
+#   hybrid    - max(core_mean, package sustained for spike_window samples)
+TEMP_SOURCES = ("package", "core_mean", "hybrid")
+DEFAULT_TEMP_SOURCE = "package"
+DEFAULT_SPIKE_WINDOW = 15
+DEFAULT_CURVE_NAME = "Default"
+# Curve hysteresis: don't rewrite pwm while the fan is within this many RPM
+# of the target, but re-apply at least every HYSTERESIS_REAPPLY_SECS.
+HYSTERESIS_RPM = 200
+HYSTERESIS_REAPPLY_SECS = 60
 OMEN_FAN_DIR = Path(__file__).parent.absolute()
 CONFIG_VERSION = 1
 
@@ -159,7 +173,11 @@ class FanController:
             "calibration_wait": DEFAULT_CALIBRATION_WAIT,
             "watchdog_interval": DEFAULT_WATCHDOG_INTERVAL,
             "ma_window": 5,
+            "temp_source": DEFAULT_TEMP_SOURCE,
+            "spike_window": DEFAULT_SPIKE_WINDOW,
             "curve": [],
+            "curves": {},
+            "active_curve": DEFAULT_CURVE_NAME,
             "bypass_warning": False,
             "mode": "auto",
             "manual_pwm": 0,
@@ -168,7 +186,7 @@ class FanController:
             "enable_experimental": False,
             "thermal_profile": "omen",
             "cached_board_name": None,
-            "debug_experimental_ui": True
+            "debug_experimental_ui": False
         }
         
         if not self.config_path.exists():
@@ -180,11 +198,77 @@ class FanController:
             
             config = defaults.copy()
             config.update(data)
+            self._migrate_curves(config)
             return config
             
         except Exception as e:
             print(f"Error loading config: {e}")
             return defaults
+
+    @staticmethod
+    def _migrate_curves(config):
+        """Older configs have a single "curve"; keep it as the "Default" entry of
+        "curves" and make sure "active_curve" points at something that exists."""
+        curves = config.get("curves")
+        if not isinstance(curves, dict):
+            curves = {}
+        if not curves and config.get("curve"):
+            curves[DEFAULT_CURVE_NAME] = config["curve"]
+        config["curves"] = curves
+        if curves and config.get("active_curve") not in curves:
+            config["active_curve"] = next(iter(curves))
+
+    # Curve library
+    def get_curves(self):
+        return self.config.get("curves", {})
+
+    def get_active_curve_name(self):
+        return self.config.get("active_curve", DEFAULT_CURVE_NAME)
+
+    def get_active_curve(self):
+        """Points [[temp, percent], ...] of the active curve (legacy "curve" as fallback)."""
+        curves = self.get_curves()
+        name = self.get_active_curve_name()
+        if name in curves:
+            return curves[name]
+        return self.config.get("curve", [])
+
+    def set_active_curve(self, name):
+        if name not in self.get_curves():
+            raise KeyError(f"No curve named '{name}'")
+        self.config["active_curve"] = name
+
+    def save_curve(self, name, points, activate=False):
+        name = name.strip()
+        if not name:
+            raise ValueError("Curve name cannot be empty")
+        self.config.setdefault("curves", {})[name] = [[float(t), float(p)] for t, p in points]
+        if activate or len(self.config["curves"]) == 1:
+            self.config["active_curve"] = name
+
+    def rename_curve(self, old, new):
+        new = new.strip()
+        curves = self.get_curves()
+        if old not in curves:
+            raise KeyError(f"No curve named '{old}'")
+        if not new:
+            raise ValueError("Curve name cannot be empty")
+        if new != old and new in curves:
+            raise ValueError(f"A curve named '{new}' already exists")
+        # rebuild to keep the ordering
+        self.config["curves"] = {(new if k == old else k): v for k, v in curves.items()}
+        if self.get_active_curve_name() == old:
+            self.config["active_curve"] = new
+
+    def delete_curve(self, name):
+        curves = self.get_curves()
+        if name not in curves:
+            raise KeyError(f"No curve named '{name}'")
+        if len(curves) == 1:
+            raise ValueError("Cannot delete the only curve")
+        del curves[name]
+        if self.get_active_curve_name() == name:
+            self.config["active_curve"] = next(iter(curves))
 
     def save_config(self):
         """Saves current configuration to JSON file."""
@@ -192,6 +276,9 @@ class FanController:
              self.config_path.parent.mkdir(parents=True, exist_ok=True)
         
         self.config["version"] = CONFIG_VERSION
+        # keep the legacy single "curve" key in sync with the active curve
+        if self.get_curves():
+            self.config["curve"] = self.get_active_curve()
         with open(self.config_path, "w") as f:
             json.dump(self.config, f, indent=4)
 
@@ -233,6 +320,14 @@ class FanController:
             return int(val) // 1000 if val else 0
         return 0
 
+
+    def get_core_mean_temp(self):
+        """Returns the average of all per-core sensors in Celsius.
+        Falls back to the package temp if no core sensors are found."""
+        cores = [t for label, t in self.get_all_core_temps() if "Core" in label]
+        if not cores:
+            return self.get_cpu_temp()
+        return sum(cores) / len(cores)
 
     def get_all_core_temps(self):
         """Returns a list of tuples [(label, temp), ...] sorted by core index."""
@@ -297,7 +392,7 @@ class FanController:
 
     def calculate_target_pwm(self, current_temp):
         """Calculates target PWM (0-255) based on curve and temperature."""
-        curve = self.config.get("curve", [])
+        curve = self.get_active_curve()
         if not curve: 
             return None
         
@@ -328,6 +423,9 @@ class FanController:
                     break
         
         return int(round(target_speed_percent / 100 * 255))
+
+    def make_curve_controller(self):
+        return CurveController(self)
 
     def calibrate(self):
         """Runs calibration routine. Yields progress (0-100), returns max RPM."""
@@ -776,3 +874,101 @@ WantedBy=multi-user.target
         except Exception as e:
             return False, f"Error: {e}"
 
+
+
+class TempEstimator:
+    """
+    Turns raw sensor readings into the temperature the fan curve is applied to.
+
+    On Intel the "Package id 0" sensor is the hottest core, not an average: a
+    single core boosting for a fraction of a second reaches Tjmax while the
+    heatsink is still cold, and a moving average only smears that spike over
+    the whole window. The "hybrid" source therefore controls on the mean of
+    all cores (what actually has to be dissipated) and only lets the package
+    reading count once it has stayed high for spike_window consecutive
+    samples (a real sustained single-core load).
+    """
+    def __init__(self, controller):
+        self.controller = controller
+        self.raw_history = []
+        self.pkg_history = []
+
+    def reset(self):
+        self.raw_history = []
+        self.pkg_history = []
+
+    def update(self):
+        """Samples the sensors once and returns a dict with:
+        package, core_mean, smoothed, sustained, control, source."""
+        cfg = self.controller.config
+        source = cfg.get("temp_source", DEFAULT_TEMP_SOURCE)
+        if source not in TEMP_SOURCES:
+            source = DEFAULT_TEMP_SOURCE
+        ma_window = max(1, int(cfg.get("ma_window", 5)))
+        spike_window = max(1, int(cfg.get("spike_window", DEFAULT_SPIKE_WINDOW)))
+
+        package = self.controller.get_cpu_temp()
+        core_mean = self.controller.get_core_mean_temp() if source != "package" else package
+        raw = package if source == "package" else core_mean
+
+        self.raw_history.append(raw)
+        del self.raw_history[:-ma_window]
+        smoothed = sum(self.raw_history) / len(self.raw_history)
+
+        self.pkg_history.append(package)
+        del self.pkg_history[:-spike_window]
+
+        sustained = None
+        control = smoothed
+        if source == "hybrid":
+            # min over the window: only counts if the package stayed hot for
+            # the whole window, so short bursts are rejected entirely.
+            if len(self.pkg_history) >= spike_window:
+                sustained = min(self.pkg_history)
+                control = max(smoothed, sustained)
+
+        return {
+            "package": package,
+            "core_mean": core_mean,
+            "smoothed": smoothed,
+            "sustained": sustained,
+            "control": control,
+            "source": source,
+        }
+
+
+class CurveController:
+    """One step of curve mode: estimate temperature, apply curve, write pwm
+    with hysteresis. Shared by the daemon and the GUI's local loop."""
+    def __init__(self, controller):
+        self.controller = controller
+        self.estimator = TempEstimator(controller)
+        self.hysteresis_start_time = None
+
+    def reset(self):
+        self.estimator.reset()
+        self.hysteresis_start_time = None
+
+    def step(self):
+        """Returns (estimate_dict, target_pwm, applied)."""
+        est = self.estimator.update()
+        target_pwm = self.controller.calculate_target_pwm(est["control"])
+        if target_pwm is None:
+            return est, None, False
+
+        should_apply = True
+        max_rpm = self.controller.config.get("fan_max", 0)
+        if max_rpm > 0:
+            current_rpm = self.controller.get_fan_speed()
+            target_rpm = (target_pwm / 255) * max_rpm
+            if abs(target_rpm - current_rpm) <= HYSTERESIS_RPM:
+                if self.hysteresis_start_time is None:
+                    self.hysteresis_start_time = time.time()
+                should_apply = time.time() - self.hysteresis_start_time > HYSTERESIS_REAPPLY_SECS
+            else:
+                self.hysteresis_start_time = None
+
+        if should_apply:
+            self.controller.set_fan_pwm(target_pwm)
+            self.hysteresis_start_time = None
+        return est, target_pwm, should_apply

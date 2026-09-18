@@ -1,3 +1,22 @@
+# Omen Fan Control
+# Control your HP Laptop's fans in Linux
+# Copyright (C) 2026 arfelious
+# Modified 2026-09-18 by Mirco Giorgi (https://github.com/mirco-g01):
+#   hybrid temperature source, named curve library, GUI/CLI fixes
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 import sys
 import os
 import signal
@@ -6,10 +25,11 @@ from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QPushButton, QLabel, QFrame, QStackedWidget,
                             QComboBox, QSpinBox, QMessageBox, QTabWidget, QFileDialog,
-                            QProgressBar, QScrollArea, QSizePolicy, QListView, QTextEdit, QStyle, QStyledItemDelegate, QCheckBox)
+                            QProgressBar, QScrollArea, QSizePolicy, QListView, QTextEdit, QStyle, QStyledItemDelegate, QCheckBox,
+                            QInputDialog)
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize, QPoint
 from PyQt6.QtGui import QFont, QIcon, QAction, QColor, QPainter, QBrush, QPen
-from omen_logic import FanController, OMEN_FAN_DIR
+from omen_logic import FanController, OMEN_FAN_DIR, TEMP_SOURCES, DEFAULT_TEMP_SOURCE, DEFAULT_SPIKE_WINDOW, TempEstimator
 from fan_curve_widget import FanCurveEditor
 
 class WorkerThread(QThread):
@@ -95,6 +115,11 @@ class CoreTempDialog(QDialog):
         pkg_layout.addWidget(self.lbl_pkg_val)
         pkg_layout.addStretch()
         self.layout_main.addWidget(self.pkg_widget)
+
+        self.lbl_mean = QLabel("Core mean: --°C")
+        self.lbl_mean.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_mean.setStyleSheet("color: #aaa;")
+        self.layout_main.addWidget(self.lbl_mean)
         
         self.grid_widget = QWidget()
         self.grid = QGridLayout(self.grid_widget)
@@ -138,6 +163,10 @@ class CoreTempDialog(QDialog):
             self.lbl_pkg_name.setText("Package")
             self.lbl_pkg_val.setText("--")
         
+        core_vals = [t for label, t in clean_temps if "Core" in label]
+        if core_vals:
+            self.lbl_mean.setText(f"Core mean: {sum(core_vals) / len(core_vals):.0f}°C")
+
         if not self.temp_labels or len(self.temp_labels) != len(clean_temps):
              self.build_grid(clean_temps)
         else:
@@ -190,7 +219,7 @@ class MainWindow(QMainWindow):
         self.resize(900, 600)
         
         # Set Window Icon
-        icon_path = OMEN_FAN_DIR / "assets" / "logo_test.png"
+        icon_path = OMEN_FAN_DIR / "assets" / "logo.png"
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
         
@@ -198,8 +227,11 @@ class MainWindow(QMainWindow):
         self.watchdog_timer = QTimer()
         self.watchdog_timer.timeout.connect(self.run_watchdog)
         
-        self.temp_history = []
-        self.temp_history_len = self.controller.config.get("ma_window", 5)
+        self.curve_ctl = self.controller.make_curve_controller()
+        self.last_estimate = None
+        # Same algorithm as the daemon, sampled every 2s, but never writes pwm:
+        # drives the header temperature so hand-made curves refer to the right number.
+        self.display_estimator = TempEstimator(self.controller)
         
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -273,8 +305,6 @@ class MainWindow(QMainWindow):
         self.rpm_timer = QTimer()
         self.rpm_timer.timeout.connect(self.update_status)
         self.rpm_timer.start(2000)
-
-        self.center_window()
 
         self.center_window()
 
@@ -503,11 +533,6 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         
         container = QFrame()
-        container.setStyleSheet("background-color: #252526; border-radius: 10px; padding: 20px;")
-        container.setFixedWidth(600)
-        c_layout = QVBoxLayout(container)
-        
-        container = QFrame()
         container.setStyleSheet("background-color: #252526; border-radius: 10px; padding: 15px;")
         container.setFixedWidth(600)
         c_layout = QVBoxLayout(container)
@@ -522,8 +547,11 @@ class MainWindow(QMainWindow):
         self.mode_combo = QComboBox()
         self.mode_combo.setView(QListView()) # Force standard list view for consistent styling
         self.mode_combo.setItemDelegate(NoFocusDelegate()) # Fix focus rect artifact
-        self.mode_combo.addItems(["Auto", "Max", "Manual", "Curve"])
-        self.mode_combo.currentTextChanged.connect(self.on_mode_change)
+        for label, key in (("Auto (BIOS fan table)", "auto"), ("Max", "max"), ("Manual", "manual"), ("Curve", "curve")):
+            self.mode_combo.addItem(label, key)
+        self.mode_combo.setToolTip("Auto hands the fans back to the firmware's own fan table (the one used by BIOS/Windows).\n"
+                                   "It is not a curve of this program and cannot be edited: use Curve mode for that.")
+        self.mode_combo.currentIndexChanged.connect(self.on_mode_change)
         mode_layout.addWidget(self.mode_combo)
         
         mode_layout.addSpacing(15)
@@ -580,22 +608,42 @@ class MainWindow(QMainWindow):
         curve_layout = QVBoxLayout(self.curve_editor_container)
         
         curve_header = QHBoxLayout()
-        curve_header.addWidget(QLabel("Fan Curve Editor"))
+        curve_header.addWidget(QLabel("Fan Curve:"))
+        
+        self.curve_combo = QComboBox()
+        self.curve_combo.setView(QListView())
+        self.curve_combo.setItemDelegate(NoFocusDelegate())
+        self.curve_combo.setFixedWidth(160)
+        self.curve_combo.setToolTip("Selecting a curve makes it the active one immediately.\n"
+                                    "Edit the points and press 'Set Mode' to save them into the selected curve.")
+        curve_header.addWidget(self.curve_combo)
+        
+        small_btn = "background-color: #444; font-size: 11px; padding: 4px; border-radius: 3px; color: white;"
+        for text, slot, width in (("New", self.new_curve, 50), ("Rename", self.rename_curve, 60),
+                                  ("Delete", self.delete_curve, 55)):
+            b = QPushButton(text)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setFixedWidth(width)
+            b.setStyleSheet(small_btn)
+            b.clicked.connect(slot)
+            curve_header.addWidget(b)
+        
         curve_header.addStretch()
         
-        reset_btn = QPushButton("Reset Curve")
+        reset_btn = QPushButton("Reset Points")
         reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         reset_btn.setFixedWidth(100)
-        reset_btn.setStyleSheet("background-color: #444; font-size: 11px; padding: 4px; border-radius: 3px; color: white;")
-        reset_btn.clicked.connect(lambda: self.curve_editor.set_points(None))
+        reset_btn.setStyleSheet(small_btn)
+        reset_btn.setToolTip("Replace the points of the selected curve with the built-in default shape (not saved until 'Set Mode')")
+        reset_btn.clicked.connect(self.reset_curve_points)
         curve_header.addWidget(reset_btn)
         
         curve_layout.addLayout(curve_header)
         
-        saved_curve = self.controller.config.get("curve", [])
-        self.curve_editor = FanCurveEditor(points=saved_curve if saved_curve else None)
+        self.curve_editor = FanCurveEditor(points=None)
         self.curve_editor.curveChanged.connect(lambda: self.curve_unsaved_lbl.setVisible(True))
         curve_layout.addWidget(self.curve_editor)
+        
         
         self.curve_unsaved_lbl = QLabel("Unsaved Changes")
         self.curve_unsaved_lbl.setVisible(False)
@@ -606,6 +654,9 @@ class MainWindow(QMainWindow):
         self.curve_unsaved_lbl.setSizePolicy(sp_c)
         
         curve_layout.addWidget(self.curve_unsaved_lbl, alignment=Qt.AlignmentFlag.AlignRight)
+
+        self.refresh_curve_combo()
+        self.curve_combo.currentIndexChanged.connect(self.on_curve_selected)
         
         curve_layout.addSpacing(20)
         
@@ -640,6 +691,14 @@ class MainWindow(QMainWindow):
         
         self.curve_editor_container.setVisible(False)
         layout.addWidget(self.curve_editor_container)
+
+        # Reflect the saved mode instead of always showing "Auto"
+        saved_mode = self.controller.config.get("mode", "auto")
+        if self.mode_combo.findData(saved_mode) >= 0:
+            self.mode_combo.setCurrentIndex(self.mode_combo.findData(saved_mode))
+        self.on_mode_change()
+        self.manual_spin.setValue(int(round(self.controller.config.get("manual_pwm", 0) / 255 * 100)))
+        self.manual_unsaved_lbl.setVisible(False)
 
         # Watchdog
         self.watchdog_check = QCheckBox("Enable Watchdog (Reset every 90s)")
@@ -783,15 +842,51 @@ class MainWindow(QMainWindow):
         self.interp_combo.currentTextChanged.connect(self.save_options)
         form_grid.addWidget(self.interp_combo, 2, 1, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         
+        lbl4 = QLabel("Curve Temperature:")
+        lbl4.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        form_grid.addWidget(lbl4, 3, 0, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+        self.temp_source_combo = QComboBox()
+        self.temp_source_combo.setView(QListView())
+        self.temp_source_combo.setItemDelegate(NoFocusDelegate())
+        self.temp_source_labels = {"package": "Package (hottest core)", "core_mean": "Core Mean", "hybrid": "Hybrid"}
+        for key in TEMP_SOURCES:
+            self.temp_source_combo.addItem(self.temp_source_labels[key], key)
+        self.temp_source_combo.setFixedWidth(180)
+        self.temp_source_combo.setToolTip(
+            "Which temperature the fan curve is applied to.\n"
+            "Package: the hottest core (Intel 'Package id 0'). A single core boosting for a fraction\n"
+            "  of a second reaches Tjmax and the fans spin up even though the CPU is barely loaded.\n"
+            "Core Mean: the average of all cores, i.e. the heat that actually has to be dissipated.\n"
+            "Hybrid (recommended): Core Mean, plus the Package reading once it has stayed hot for\n"
+            "  'Spike Filter' consecutive samples (a real sustained single-core load).")
+        current_source = self.controller.config.get("temp_source", DEFAULT_TEMP_SOURCE)
+        self.temp_source_combo.setCurrentIndex(max(0, self.temp_source_combo.findData(current_source)))
+        self.temp_source_combo.currentIndexChanged.connect(self.save_options)
+        form_grid.addWidget(self.temp_source_combo, 3, 1, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+        self.lbl_spike = QLabel("Spike Filter (N):")
+        self.lbl_spike.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        form_grid.addWidget(self.lbl_spike, 4, 0, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+        self.spike_spin = QSpinBox()
+        self.spike_spin.setRange(1, 60)
+        self.spike_spin.setFixedWidth(80)
+        self.spike_spin.setValue(self.controller.config.get("spike_window", DEFAULT_SPIKE_WINDOW))
+        self.spike_spin.setToolTip("Hybrid only: number of consecutive samples (2s each) the Package temperature\n"
+                                   "must stay high before it is allowed to raise the fans. Shorter bursts are ignored.")
+        self.spike_spin.valueChanged.connect(self.save_options)
+        form_grid.addWidget(self.spike_spin, 4, 1, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
         self.bypass_check = QCheckBox("Bypass Driver Patch Warning")
         self.bypass_check.setChecked(self.controller.config.get("bypass_patch_warning", False))
         self.bypass_check.toggled.connect(self.save_options)
-        form_grid.addWidget(self.bypass_check, 3, 0, 1, 2, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        form_grid.addWidget(self.bypass_check, 5, 0, 1, 2, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
         self.bypass_root_check = QCheckBox("Bypass Root Warning")
         self.bypass_root_check.setChecked(self.controller.config.get("bypass_root_warning", False))
         self.bypass_root_check.toggled.connect(self.save_options)
-        form_grid.addWidget(self.bypass_root_check, 4, 0, 1, 2, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        form_grid.addWidget(self.bypass_root_check, 6, 0, 1, 2, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
         # Experimental Support Section
         exp_group = QWidget()
@@ -851,7 +946,7 @@ class MainWindow(QMainWindow):
         
         exp_layout.addWidget(self.exp_options_widget)
         
-        form_grid.addWidget(exp_group, 5, 0, 1, 2)
+        form_grid.addWidget(exp_group, 7, 0, 1, 2)
         
         # Init visibility
         self.toggle_experimental_options(self.exp_check.isChecked())
@@ -985,15 +1080,25 @@ class MainWindow(QMainWindow):
     def show_about(self): self.show_page(self.stack.widget(5), "About")
 
     # Core Logic
-    def update_status(self, temp_override=None):
+    def update_status(self, estimate=None):
         rpm = self.controller.get_fan_speed()
-        if temp_override is not None:
-             temp = int(temp_override)
-        else:
-             temp = self.controller.get_cpu_temp()
+        if estimate is None:
+            estimate = self.last_estimate
+        if estimate is None:
+            # local loop not running (service mode): sample for display only
+            estimate = self.display_estimator.update()
+
+        source = self.temp_source_labels.get(estimate["source"], estimate["source"])
+        tip = (f"Curve control temperature ({source}): {estimate['control']:.0f}°C\n"
+               f"Package (hottest core): {estimate['package']}°C\n"
+               f"Core mean: {estimate['core_mean']:.0f}°C")
+        if estimate["sustained"] is not None:
+            tip += f"\nPackage sustained (min over spike window): {estimate['sustained']}°C"
+        tip += "\nThe fan curve is applied to the control temperature. Click for per-core temperatures."
         
         self.rpm_label.setText(f"{rpm} RPM")
-        self.temp_label.setText(f"{temp}°C")
+        self.temp_label.setText(f"{int(round(estimate['control']))}°C")
+        self.temp_label.setToolTip(tip)
         
         self.check_driver_status()
 
@@ -1019,15 +1124,19 @@ class MainWindow(QMainWindow):
         if "Needs Driver Installation" in self.status_label.text():
             self.show_driver()
         
-    def on_mode_change(self, text):
-        self.manual_widget.setVisible(text == "Manual")
-        self.curve_editor_container.setVisible(text == "Curve")
+    def current_mode(self):
+        return self.mode_combo.currentData() or "auto"
+
+    def on_mode_change(self, *_):
+        mode = self.current_mode()
+        self.manual_widget.setVisible(mode == "manual")
+        self.curve_editor_container.setVisible(mode == "curve")
         
         self.manual_unsaved_lbl.setVisible(False)
         self.curve_unsaved_lbl.setVisible(False)
 
     def apply_fan_mode(self):
-        mode = self.mode_combo.currentText().lower()
+        mode = self.current_mode()
         
         # Check driver requirement for Manual/Curve
         if mode in ["manual", "curve"]:
@@ -1049,8 +1158,8 @@ class MainWindow(QMainWindow):
             pwm_val = int(round(percent / 100 * 255))
             self.controller.config["manual_pwm"] = pwm_val
         elif mode == "curve":
-            points = self.curve_editor.get_points()
-            self.controller.config["curve"] = points
+            name = self.curve_combo.currentText() or self.controller.get_active_curve_name()
+            self.controller.save_curve(name, self.curve_editor.get_points(), activate=True)
             
         self.controller.save_config()
         
@@ -1063,9 +1172,13 @@ class MainWindow(QMainWindow):
             # Ensure local loop is stopped
             if hasattr(self, 'curve_timer'):
                 self.curve_timer.stop()
+            self.last_estimate = None
             return
 
         # Local application for non-service users
+        if mode != "curve" and hasattr(self, 'curve_timer'):
+            self.curve_timer.stop()
+            self.last_estimate = None
         if mode == "auto":
             self.controller.set_fan_mode("auto")
             self.status_label.setText("Set mode to Auto")
@@ -1080,70 +1193,132 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Curve mode enabled")
             self.start_curve_loop()
 
+    # Curve library
+    def refresh_curve_combo(self):
+        """Fills the combo from the config and loads the active curve into the editor."""
+        self.curve_combo.blockSignals(True)
+        self.curve_combo.clear()
+        for name in self.controller.get_curves():
+            self.curve_combo.addItem(name)
+        active = self.controller.get_active_curve_name()
+        idx = self.curve_combo.findText(active)
+        if idx >= 0:
+            self.curve_combo.setCurrentIndex(idx)
+        self.curve_combo.blockSignals(False)
+        self.load_curve_into_editor(active)
+
+    def load_curve_into_editor(self, name):
+        points = self.controller.get_curves().get(name)
+        self.curve_editor.set_points(points if points else None)
+        self.curve_unsaved_lbl.setVisible(False)
+
+    def discard_unsaved_curve_edits(self):
+        """Returns False if the user wants to keep editing the current curve."""
+        if self.curve_unsaved_lbl.isHidden():
+            return True
+        reply = QMessageBox.question(self, "Unsaved Changes",
+                                     "The curve has unsaved edits. Discard them?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        return reply == QMessageBox.StandardButton.Yes
+
+    def on_curve_selected(self, index):
+        name = self.curve_combo.itemText(index)
+        if not name or name == self.controller.get_active_curve_name():
+            return
+        if not self.discard_unsaved_curve_edits():
+            self.curve_combo.blockSignals(True)
+            self.curve_combo.setCurrentText(self.controller.get_active_curve_name())
+            self.curve_combo.blockSignals(False)
+            return
+        self.controller.set_active_curve(name)
+        self.controller.save_config()
+        self.load_curve_into_editor(name)
+        self.curve_ctl.reset()
+        if self.controller.config.get("mode") == "curve":
+            self.status_label.setText(f"Curve '{name}' is now active.")
+        else:
+            self.status_label.setText(f"Curve '{name}' selected (press 'Set Mode' to enable Curve mode).")
+
+    def ask_curve_name(self, title, default=""):
+        while True:
+            name, ok = QInputDialog.getText(self, title, "Curve name:", text=default)
+            if not ok:
+                return None
+            name = name.strip()
+            if not name:
+                continue
+            if name in self.controller.get_curves() and name != default:
+                QMessageBox.warning(self, title, f"A curve named '{name}' already exists.")
+                continue
+            return name
+
+    def new_curve(self):
+        if not self.discard_unsaved_curve_edits():
+            return
+        name = self.ask_curve_name("New Curve")
+        if not name:
+            return
+        # start from the current editor shape so "duplicate and tweak" is one click away
+        self.controller.save_curve(name, self.curve_editor.get_points(), activate=True)
+        self.controller.save_config()
+        self.refresh_curve_combo()
+        self.curve_ctl.reset()
+        self.status_label.setText(f"Curve '{name}' created and active.")
+
+    def rename_curve(self):
+        old = self.curve_combo.currentText()
+        if not old:
+            return
+        new = self.ask_curve_name("Rename Curve", default=old)
+        if not new or new == old:
+            return
+        self.controller.rename_curve(old, new)
+        self.controller.save_config()
+        self.refresh_curve_combo()
+        self.status_label.setText(f"Curve '{old}' renamed to '{new}'.")
+
+    def delete_curve(self):
+        name = self.curve_combo.currentText()
+        if not name:
+            return
+        if len(self.controller.get_curves()) <= 1:
+            QMessageBox.information(self, "Delete Curve", "The last remaining curve cannot be deleted.")
+            return
+        reply = QMessageBox.question(self, "Delete Curve", f"Delete curve '{name}'?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.controller.delete_curve(name)
+        self.controller.save_config()
+        self.refresh_curve_combo()
+        self.curve_ctl.reset()
+        self.status_label.setText(f"Curve '{name}' deleted. Active: '{self.controller.get_active_curve_name()}'.")
+
+    def reset_curve_points(self):
+        self.curve_editor.set_points(None)
+        self.curve_unsaved_lbl.setVisible(True)
+
     def start_curve_loop(self):
         if not hasattr(self, 'curve_timer'):
             self.curve_timer = QTimer()
             self.curve_timer.timeout.connect(self.apply_curve_step)
+        self.curve_ctl.reset()
+        self.last_estimate = None
         
         # If service is running, do not run local loop
         if self.controller.is_service_running():
             self.curve_timer.stop()
             return
 
-        if self.mode_combo.currentText() == "Curve":
+        if self.current_mode() == "curve":
             self.curve_timer.start(2000)
         else:
             self.curve_timer.stop()
 
     def apply_curve_step(self):
-        raw_temp = self.controller.get_cpu_temp()
-        
-        self.temp_history.append(raw_temp)
-        if len(self.temp_history) > self.temp_history_len:
-            self.temp_history.pop(0)
-            
-        avg_temp = sum(self.temp_history) / len(self.temp_history)
-        
-        self.update_status(avg_temp)
-        
-        curve = self.controller.config.get("curve", [])
-        if not curve: return
-        
-        curve.sort(key=lambda p: p[0])
-        target_speed = 0
-        
-        temp = avg_temp
-        
-        target_pwm = self.controller.calculate_target_pwm(temp)
-        if target_pwm is None:
-             return
-             
-        pwm_val = target_pwm
-        
-        current_rpm = self.controller.get_fan_speed()
-        max_rpm = self.controller.config.get("fan_max", 0)
-        
-        if max_rpm > 0:
-            target_rpm = (pwm_val / 255) * max_rpm
-            diff = abs(target_rpm - current_rpm)
-            
-            import time
-            
-            if diff < 200:
-                if not hasattr(self, 'hysteresis_start_time') or self.hysteresis_start_time is None:
-                    self.hysteresis_start_time = time.time()
-                
-                if time.time() - self.hysteresis_start_time > 60:
-                    self.controller.set_fan_pwm(pwm_val)
-                    self.hysteresis_start_time = None
-                    pass 
-                else:
-                    return
-            else:
-                self.hysteresis_start_time = None
-                self.controller.set_fan_pwm(pwm_val)
-        else:
-            self.controller.set_fan_pwm(pwm_val)
+        est, _, _ = self.curve_ctl.step()
+        self.last_estimate = est
+        self.update_status(est)
 
     def start_calibration(self):
         if hasattr(self, 'curve_timer'):
@@ -1219,6 +1394,14 @@ class MainWindow(QMainWindow):
     def save_options(self):
         self.controller.config['calibration_wait'] = self.wait_spin.value()
         self.controller.config['ma_window'] = self.ma_spin.value()
+        new_source = self.temp_source_combo.currentData() or DEFAULT_TEMP_SOURCE
+        if new_source != self.controller.config.get('temp_source', DEFAULT_TEMP_SOURCE):
+            self.curve_ctl.reset()
+            self.display_estimator.reset()
+        self.controller.config['temp_source'] = new_source
+        self.controller.config['spike_window'] = self.spike_spin.value()
+        self.spike_spin.setEnabled(new_source == "hybrid")
+        self.lbl_spike.setEnabled(new_source == "hybrid")
         self.controller.config['curve_interpolation'] = self.interp_combo.currentText().lower()
         self.controller.config['bypass_patch_warning'] = self.bypass_check.isChecked()
         self.controller.config['bypass_root_warning'] = self.bypass_root_check.isChecked()
@@ -1229,7 +1412,6 @@ class MainWindow(QMainWindow):
         profile_map = {0: "omen", 1: "victus", 2: "victus_s"}
         self.controller.config['thermal_profile'] = profile_map.get(self.profile_combo.currentIndex(), "omen")
 
-        self.temp_history_len = self.ma_spin.value()
         self.controller.save_config()
         
         # If save button was clicked on exp options, give feedback
@@ -1309,12 +1491,13 @@ class MainWindow(QMainWindow):
                 # Stop local loop if service is running
                 if hasattr(self, 'curve_timer') and self.curve_timer.isActive():
                     self.curve_timer.stop()
+                    self.last_estimate = None
             else:
                 self.svc_status_label.setText("Service: Inactive")
                 self.svc_status_label.setStyleSheet("color: #ff9800; font-weight: bold;") # Orange
                 
                 # Resume local loop if in Curve mode and service is not running
-                if self.mode_combo.currentText() == "Curve" and not (hasattr(self, 'curve_timer') and self.curve_timer.isActive()):
+                if self.current_mode() == "curve" and not (hasattr(self, 'curve_timer') and self.curve_timer.isActive()):
                     self.start_curve_loop()
 
     def restart_service_request(self):
@@ -1385,6 +1568,9 @@ class MainWindow(QMainWindow):
         self.controller.stop_stress_test()
         self.watchdog_timer.stop()
         self.rpm_timer.stop()
+        self.svc_timer.stop()
+        if hasattr(self, 'curve_timer'):
+            self.curve_timer.stop()
         event.accept()
 
 if __name__ == "__main__":

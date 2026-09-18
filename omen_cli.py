@@ -2,6 +2,8 @@
 # Omen Fan Control
 # Control your HP Laptop's fans in Linux
 # Copyright (C) 2026 arfelious
+# Modified 2026-09-18 by Mirco Giorgi (https://github.com/mirco-g01):
+#   hybrid temperature source, named curve library, GUI/CLI fixes
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -18,7 +20,17 @@
 
 import click
 import sys
-from omen_logic import FanController, OMEN_FAN_DIR
+from omen_logic import FanController, OMEN_FAN_DIR, TEMP_SOURCES, DEFAULT_TEMP_SOURCE, DEFAULT_SPIKE_WINDOW
+
+class ShowableChoice(click.Choice):
+    """click.Choice that also accepts the 'show' sentinel used by flag_value,
+    so `--option` without a value prints the current setting."""
+    def __init__(self, choices):
+        super().__init__(list(choices) + ['show'])
+        self.visible = list(choices)
+
+    def get_metavar(self, param, ctx=None):
+        return "[" + "|".join(self.visible) + "]"
 
 @click.group()
 @click.option('--config', type=click.Path(), help="Path to custom config file")
@@ -170,8 +182,9 @@ def install_patch(install_type, temp, perm, restore):
 @click.option('--mode', type=click.Choice(['auto', 'max', 'manual', 'curve', 'last']), help="Set fan mode. 'last' loads from config.")
 @click.option('--value', required=False, help="Manual value: 0-255 (PWM) or 0-100% (e.g. '50%')")
 @click.option('--curve-csv', required=False, type=click.Path(exists=True), help="CSV file for curve mode (format: temp,percent)")
+@click.option('--curve-name', required=False, help="Named curve to activate (or to save --curve-csv into). Default: the active curve.")
 @click.argument('action', required=False)
-def fan_control(mode, value, curve_csv, action):
+def fan_control(mode, value, curve_csv, curve_name, action):
     """
     Control fan mode and speed.
     Usage:
@@ -179,7 +192,7 @@ def fan_control(mode, value, curve_csv, action):
       fan-control set  (Applies last saved mode)
     """
     if mode is None:
-        if curve_csv:
+        if curve_csv or curve_name:
             mode = 'curve'
         elif action == 'set':
             mode = 'last'
@@ -277,12 +290,20 @@ def fan_control(mode, value, curve_csv, action):
                      return
                 
                 points.sort(key=lambda x: x[0])
-                controller.config["curve"] = points
-                click.echo(f"Loaded {len(points)} points from CSV.")
+                name = curve_name or controller.get_active_curve_name()
+                controller.save_curve(name, points, activate=True)
+                click.echo(f"Loaded {len(points)} points from CSV into curve '{name}'.")
                 
             except Exception as e:
                 click.echo(f"Error reading CSV: {e}")
                 return
+        elif curve_name:
+            try:
+                controller.set_active_curve(curve_name)
+            except KeyError:
+                click.echo(f"Error: no curve named '{curve_name}'. Available: {', '.join(controller.get_curves()) or '(none)'}")
+                return
+            click.echo(f"Active curve: '{curve_name}'")
 
         controller.config["mode"] = "curve"
         controller.save_config()
@@ -303,14 +324,9 @@ def serve():
     controller = get_controller()
     click.echo("Starting Omen Fan Control Daemon...")
     
-    ma_window = controller.config.get("ma_window", 5)
-    temp_history = []
-    
-    watchdog_interval = controller.config.get("watchdog_interval", 90)
-    last_watchdog_time = time.time()
-    hysteresis_start_time = None
-    
+    curve_ctl = controller.make_curve_controller()
     last_config_mtime = 0
+    last_source = None
     
     while True:
         try:
@@ -329,44 +345,14 @@ def serve():
                 time.sleep(1)
                 continue
             
-            if time.time() - last_watchdog_time > watchdog_interval:
-                last_watchdog_time = time.time()
-                
-            current_temp = controller.get_cpu_temp()
-            
-            ma_window = controller.config.get("ma_window", 5)
-            temp_history.append(current_temp)
-            if len(temp_history) > ma_window:
-                temp_history.pop(0)
-            avg_temp = sum(temp_history) / len(temp_history)
-            
             if mode == "curve":
-                target_pwm = controller.calculate_target_pwm(avg_temp)
-                if target_pwm is not None:
-                     current_rpm = controller.get_fan_speed()
-                     max_rpm = controller.config.get("fan_max", 0)
-                     
-                     should_apply = True
-                     
-                     if max_rpm > 0:
-                         target_rpm = (target_pwm / 255) * max_rpm
-                         diff = abs(target_rpm - current_rpm)
-                         
-                         if diff <= 200:
-                             if hysteresis_start_time is None:
-                                 hysteresis_start_time = time.time()
-                             
-                             if time.time() - hysteresis_start_time > 60:
-                                 should_apply = True
-                             else:
-                                 should_apply = False
-                         else:
-                             hysteresis_start_time = None
-                             should_apply = True
-                     
-                     if should_apply:
-                         controller.set_fan_pwm(target_pwm)
-                         hysteresis_start_time = None
+                source = controller.config.get("temp_source", DEFAULT_TEMP_SOURCE)
+                if source != last_source:
+                    # History from another source is meaningless, start clean
+                    curve_ctl.reset()
+                    click.echo(f"Curve mode: temperature source '{source}'")
+                    last_source = source
+                curve_ctl.step()
             
             elif mode == "manual":
                 manual_val = controller.config.get("manual_pwm", -1)
@@ -447,11 +433,13 @@ def stress(duration):
 @click.option('--wait-time', type=int, required=False, is_flag=False, flag_value=-1, help="Time to wait during calibration (seconds). No arg shows current.")
 @click.option('--watchdog', type=int, required=False, is_flag=False, flag_value=-1, help="Watchdog interval (seconds). No arg shows current.")
 @click.option('--ma-window', type=int, required=False, is_flag=False, flag_value=-1, help="Moving Average Window size. No arg shows current.")
-@click.option('--bypass-warning', type=click.Choice(['on', 'off']), required=False, is_flag=False, flag_value='show', help="Bypass driver patch warning. No arg shows current.")
-@click.option('--curve-interpolation', type=click.Choice(['smooth', 'discrete']), required=False, is_flag=False, flag_value='show', help="Curve interpolation mode. No arg shows current.")
-@click.option('--enable-experimental', type=click.Choice(['on', 'off']), required=False, is_flag=False, flag_value='show', help="Enable experimental board support. No arg shows current.")
-@click.option('--thermal-profile', type=click.Choice(['omen', 'victus', 'victus_s']), required=False, is_flag=False, flag_value='show', help="Set thermal profile for exp. support. No arg shows current.")
-def options(wait_time, watchdog, ma_window, bypass_warning, curve_interpolation, enable_experimental, thermal_profile):
+@click.option('--temp-source', type=ShowableChoice(list(TEMP_SOURCES)), required=False, is_flag=False, flag_value='show', help="Temperature the curve is applied to: package (hottest core), core_mean, hybrid. No arg shows current.")
+@click.option('--spike-window', type=int, required=False, is_flag=False, flag_value=-1, help="Hybrid: samples the package must stay hot before it counts. No arg shows current.")
+@click.option('--bypass-warning', type=ShowableChoice(['on', 'off']), required=False, is_flag=False, flag_value='show', help="Bypass driver patch warning. No arg shows current.")
+@click.option('--curve-interpolation', type=ShowableChoice(['smooth', 'discrete']), required=False, is_flag=False, flag_value='show', help="Curve interpolation mode. No arg shows current.")
+@click.option('--enable-experimental', type=ShowableChoice(['on', 'off']), required=False, is_flag=False, flag_value='show', help="Enable experimental board support. No arg shows current.")
+@click.option('--thermal-profile', type=ShowableChoice(['omen', 'victus', 'victus_s']), required=False, is_flag=False, flag_value='show', help="Set thermal profile for exp. support. No arg shows current.")
+def options(wait_time, watchdog, ma_window, temp_source, spike_window, bypass_warning, curve_interpolation, enable_experimental, thermal_profile):
     """
     Configure or view options.
     Run without arguments to view all current settings.
@@ -460,10 +448,12 @@ def options(wait_time, watchdog, ma_window, bypass_warning, curve_interpolation,
     """
     controller = get_controller()
     
-    if all(x is None for x in [wait_time, watchdog, ma_window, bypass_warning, curve_interpolation]):
+    if all(x is None for x in [wait_time, watchdog, ma_window, temp_source, spike_window, bypass_warning, curve_interpolation, enable_experimental, thermal_profile]):
         wt = controller.config.get('calibration_wait', 5)
         wd = controller.config.get('watchdog_interval', 90)
         mw = controller.config.get('ma_window', 5)
+        ts = controller.config.get('temp_source', DEFAULT_TEMP_SOURCE)
+        sw = controller.config.get('spike_window', DEFAULT_SPIKE_WINDOW)
         bp = controller.config.get('bypass_patch_warning', False)
         ci = controller.config.get('curve_interpolation', 'smooth')
         ee = controller.config.get('enable_experimental', False)
@@ -473,6 +463,8 @@ def options(wait_time, watchdog, ma_window, bypass_warning, curve_interpolation,
         click.echo(f"  Calibration Wait Time: {wt}s \t--wait-time")
         click.echo(f"  Watchdog Interval:     {wd}s \t--watchdog")
         click.echo(f"  MA Window (Smoothing): {mw}  \t--ma-window")
+        click.echo(f"  Temperature Source:    {ts} \t--temp-source")
+        click.echo(f"  Spike Window (hybrid): {sw}  \t--spike-window")
         click.echo(f"  Bypass Warning:        {'On' if bp else 'Off'} \t--bypass-warning")
         click.echo(f"  Curve Interpolation:   {ci} \t--curve-interpolation")
         click.echo(f"  Experimental Support:  {'On' if ee else 'Off'} \t--enable-experimental")
@@ -514,6 +506,26 @@ def options(wait_time, watchdog, ma_window, bypass_warning, curve_interpolation,
         else:
             click.echo("Error: MA Window must be positive.")
     
+    if temp_source is not None:
+        if temp_source == 'show':
+            val = controller.config.get('temp_source', DEFAULT_TEMP_SOURCE)
+            click.echo(f"Current Temperature Source: {val}")
+        else:
+            controller.config['temp_source'] = temp_source
+            changed = True
+            click.echo(f"Temperature Source set to {temp_source}")
+
+    if spike_window is not None:
+        if spike_window == -1:
+            val = controller.config.get('spike_window', DEFAULT_SPIKE_WINDOW)
+            click.echo(f"Current Spike Window: {val}")
+        elif spike_window > 0:
+            controller.config['spike_window'] = spike_window
+            changed = True
+            click.echo(f"Spike Window set to {spike_window}")
+        else:
+            click.echo("Error: Spike Window must be positive.")
+
     if bypass_warning is not None:
         if bypass_warning == 'show':
             val = controller.config.get('bypass_patch_warning', False)
@@ -554,6 +566,84 @@ def options(wait_time, watchdog, ma_window, bypass_warning, curve_interpolation,
         
     if changed:
         controller.save_config()
+
+@cli.group()
+def curves():
+    """Manage the library of named fan curves"""
+    pass
+
+@curves.command('list')
+def curves_list():
+    """List saved curves (* = active)"""
+    controller = get_controller()
+    lib = controller.get_curves()
+    if not lib:
+        click.echo("No curves saved.")
+        return
+    active = controller.get_active_curve_name()
+    for name, pts in lib.items():
+        mark = "*" if name == active else " "
+        desc = ", ".join(f"{int(round(t))}°C:{int(round(p))}%" for t, p in pts)
+        click.echo(f" {mark} {name:<20} {desc}")
+
+@curves.command('use')
+@click.argument('name')
+def curves_use(name):
+    """Activate NAME (the service picks it up within a couple of seconds)"""
+    controller = get_controller()
+    try:
+        controller.set_active_curve(name)
+    except KeyError:
+        click.echo(f"Error: no curve named '{name}'. Available: {', '.join(controller.get_curves()) or '(none)'}")
+        sys.exit(1)
+    controller.save_config()
+    click.echo(f"Active curve: '{name}'")
+
+@curves.command('rename')
+@click.argument('old')
+@click.argument('new')
+def curves_rename(old, new):
+    """Rename curve OLD to NEW"""
+    controller = get_controller()
+    try:
+        controller.rename_curve(old, new)
+    except (KeyError, ValueError) as e:
+        click.echo(f"Error: {e}")
+        sys.exit(1)
+    controller.save_config()
+    click.echo(f"Renamed '{old}' to '{new}'.")
+
+@curves.command('delete')
+@click.argument('name')
+def curves_delete(name):
+    """Delete curve NAME (the last remaining curve cannot be deleted)"""
+    controller = get_controller()
+    try:
+        controller.delete_curve(name)
+    except (KeyError, ValueError) as e:
+        click.echo(f"Error: {e}")
+        sys.exit(1)
+    controller.save_config()
+    click.echo(f"Deleted '{name}'. Active curve: '{controller.get_active_curve_name()}'")
+
+@curves.command('export')
+@click.argument('name', required=False)
+@click.option('--csv', 'csv_path', type=click.Path(), help="Write to this file instead of stdout")
+def curves_export(name, csv_path):
+    """Print curve NAME (default: active) as temp,percent CSV"""
+    controller = get_controller()
+    name = name or controller.get_active_curve_name()
+    pts = controller.get_curves().get(name)
+    if pts is None:
+        click.echo(f"Error: no curve named '{name}'.")
+        sys.exit(1)
+    lines = [f"# {name}"] + [f"{int(round(t))},{int(round(p))}" for t, p in pts]
+    if csv_path:
+        with open(csv_path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        click.echo(f"Wrote {len(pts)} points to {csv_path}")
+    else:
+        click.echo("\n".join(lines))
 
 @cli.group()
 def service():
@@ -645,6 +735,8 @@ def status():
     # 4. Temperatures
     pkg_temp = controller.get_cpu_temp()
     click.echo(f"CPU Package Temp:  {pkg_temp}°C")
+    click.echo(f"CPU Core Mean:     {controller.get_core_mean_temp():.0f}°C")
+    click.echo(f"Curve Temp Source: {controller.config.get('temp_source', DEFAULT_TEMP_SOURCE)}")
     
     click.echo("\nCore Temperatures:")
     cores = controller.get_all_core_temps()
@@ -677,12 +769,17 @@ def enable_bios():
 @click.option('--wait-time', type=int, required=False, is_flag=False, flag_value=-1, help="Time to wait during calibration (seconds). No arg shows current.")
 @click.option('--watchdog', type=int, required=False, is_flag=False, flag_value=-1, help="Watchdog interval (seconds). No arg shows current.")
 @click.option('--ma-window', type=int, required=False, is_flag=False, flag_value=-1, help="Moving Average Window size. No arg shows current.")
-@click.option('--bypass-warning', type=click.Choice(['on', 'off']), required=False, is_flag=False, flag_value='show', help="Bypass driver patch warning. No arg shows current.")
-@click.option('--curve-interpolation', type=click.Choice(['smooth', 'discrete']), required=False, is_flag=False, flag_value='show', help="Curve interpolation mode. No arg shows current.")
+@click.option('--temp-source', type=ShowableChoice(list(TEMP_SOURCES)), required=False, is_flag=False, flag_value='show', help="Temperature the curve is applied to: package (hottest core), core_mean, hybrid. No arg shows current.")
+@click.option('--spike-window', type=int, required=False, is_flag=False, flag_value=-1, help="Hybrid: samples the package must stay hot before it counts. No arg shows current.")
+@click.option('--bypass-warning', type=ShowableChoice(['on', 'off']), required=False, is_flag=False, flag_value='show', help="Bypass driver patch warning. No arg shows current.")
+@click.option('--curve-interpolation', type=ShowableChoice(['smooth', 'discrete']), required=False, is_flag=False, flag_value='show', help="Curve interpolation mode. No arg shows current.")
+@click.option('--enable-experimental', type=ShowableChoice(['on', 'off']), required=False, is_flag=False, flag_value='show', help="Enable experimental board support. No arg shows current.")
+@click.option('--thermal-profile', type=ShowableChoice(['omen', 'victus', 'victus_s']), required=False, is_flag=False, flag_value='show', help="Set thermal profile for exp. support. No arg shows current.")
 @click.pass_context
-def settings(ctx, wait_time, watchdog, ma_window, bypass_warning, curve_interpolation):
+def settings(ctx, wait_time, watchdog, ma_window, temp_source, spike_window, bypass_warning, curve_interpolation, enable_experimental, thermal_profile):
     """Alias for options"""
-    ctx.invoke(options, wait_time=wait_time, watchdog=watchdog, ma_window=ma_window, bypass_warning=bypass_warning, curve_interpolation=curve_interpolation)
+    ctx.invoke(options, wait_time=wait_time, watchdog=watchdog, ma_window=ma_window, temp_source=temp_source, spike_window=spike_window,
+               bypass_warning=bypass_warning, curve_interpolation=curve_interpolation, enable_experimental=enable_experimental, thermal_profile=thermal_profile)
 
 @cli.command()
 def license():

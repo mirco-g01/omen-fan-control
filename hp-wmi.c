@@ -1375,6 +1375,7 @@ err_uninstall_notifier:
   wmi_remove_notify_handler(HPWMI_EVENT_GUID);
 err_free_dev:
   input_free_device(hp_wmi_input_dev);
+  hp_wmi_input_dev = NULL;
   return err;
 }
 
@@ -2685,8 +2686,18 @@ static int __init hp_wmi_init(void) {
 
   if (event_capable) {
     err = hp_wmi_input_setup();
-    if (err)
-      return err;
+    if (err) {
+      /*
+       * Another driver (e.g. omen-rgb-keyboard) may already hold the
+       * exclusive WMI notify handler for HPWMI_EVENT_GUID. Hotkey/input
+       * support is independent of the BIOS/fan/thermal functionality
+       * below, so don't abort the whole module over it.
+       */
+      pr_warn("hp-wmi: hotkey input setup failed (%d), continuing without "
+              "hotkey support (BIOS/fan/thermal features are unaffected)\n",
+              err);
+      event_capable = 0;
+    }
   }
 
   if (bios_capable) {
