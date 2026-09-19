@@ -8,8 +8,9 @@
 > listed in [Changes in this fork](#changes-in-this-fork).
 >
 > This fork is based on upstream commit `0ba2bc6` (2026-03-07). Upstream has since moved on to
-> v2.0.0 with a new `src/` package layout, fan cleaning, GPU-temperature curves and packaging;
-> those changes are **not** included here.
+> v2.0.0 with a new `src/` package layout, GPU-temperature curves and packaging; those changes are
+> **not** included here. Fan cleaning is implemented here independently, using the same WMI
+> protocol upstream found.
 
 This tool provides fan control for HP Omen Max, Victus and Omen laptops on Linux. It includes installer for a kernel driver patch (`hp-wmi`) to expose PWM controls and a userspace utility to manage fan curves, create watchdog that sets the fan configuration periodically and a simple stress test tool to see the fan curve in effect.
 
@@ -165,6 +166,34 @@ fan table (the one BIOS/Windows use), which cannot be read or edited.
 
 <br>
 
+**Fan Cleaning (reverse spin):**
+
+The OMEN Gaming Hub "Fan cleaning" routine: the fans stop, spin *backwards* for a while to blow dust
+out of the heatsinks, then are handed back to the firmware. Available from the GUI (*Fan Cleaning* page)
+and the CLI:
+```bash
+sudo python3 omen_cli.py clean status                     # support, settings, last / next run
+sudo python3 omen_cli.py clean run [--duration 30] [--speed 37]
+sudo python3 omen_cli.py clean stop                       # abort a run in progress
+sudo python3 omen_cli.py options --cleaner-auto on --cleaner-interval 1w   # periodic (service): 36h, 7d, 2w, 1m
+sudo python3 omen_cli.py options --cleaner-window 8-22                     # only start between these hours ('any' to disable)
+sudo python3 omen_cli.py options --cleaner-duration 30 --cleaner-speed 37  # speed in x100 RPM
+```
+- Needs the `acpi_call` kernel module (`sudo modprobe acpi_call`; Arch: `acpi_call-dkms`,
+  Debian/Ubuntu: `acpi-call-dkms`) and the patched driver (for RPM readback).
+- When the background service is running it performs the cleaning itself (GUI and CLI just ask it),
+  so nothing else touches the fans meanwhile; otherwise the GUI/CLI run it directly.
+- Safety: refused above 75 °C (core mean) and aborted if that is reached during the run, if the fans
+  do not stop within 7 s, or if the EC does not actually reverse.
+- Automatic runs (GUI: *every day / 3 days / week / 2 weeks / month / custom*, default weekly) only
+  start inside the allowed hours (default 08:00–22:00, `22-6` wraps midnight), on AC power and with a
+  cool CPU; otherwise they are retried 10 minutes later. The first run happens one interval after
+  enabling; `clean status` and the GUI show the next scheduled time.
+- Duration 10–90 s (the EC drops user fan control after 120 s). The default reverse speed is
+  3700 RPM, the value OMEN Gaming Hub was observed to use; the firmware may cap higher requests.
+
+<br>
+
 **Detailed Information**
 
 Commands provide detailed information when `--help` is passed with the command
@@ -184,6 +213,10 @@ Tested on an HP Omen Max 16 (board `8D41`, Intel Core Ultra 7 255HX) running Arc
 - The header temperature in the GUI is now the temperature the curve is actually applied to.
 - **Named curve library**: several curves, switchable from the GUI (combo above the editor) or with
   `omen_cli.py curves list|use|rename|delete|export`; the service follows the change within 2 s.
+- **Fan cleaning** (GUI *Fan Cleaning* page, `omen_cli.py clean run|stop|status`, `--cleaner-*`
+  options): reverse-spin dust removal as in OMEN Gaming Hub, on demand or every N hours via the
+  service. Same EC command the driver uses for manual speed (WMI `0x2E`) with the reverse bit set,
+  sent through `acpi_call`. Braking, decelerated release and thermal/timeout aborts included.
 - The curve step (temperature estimate + hysteresis) is shared between the daemon and the GUI's
   local loop instead of being implemented twice.
 - Fixes: CLI options given without a value (`--bypass-warning`, `--curve-interpolation`, …) crashed
@@ -220,6 +253,9 @@ Modifying kernel drivers and manipulating thermal control systems can potentiall
 
 **Probes:**
 - https://github.com/alou-S/omen-fan/blob/main/docs/probes.md
+
+**Fan cleaning WMI protocol (reverse bit, capability query):**
+- https://github.com/arfelious/omen-fan-control (v2.0.0, `_cleaner.py`)
 
 **Linux 6.20 Kernel HP-WMI Driver:**
 - https://git.kernel.org/pub/scm/linux/kernel/git/pdx86/platform-drivers-x86.git/commit/?h=for-next&id=46be1453e6e61884b4840a768d1e8ffaf01a4c1c

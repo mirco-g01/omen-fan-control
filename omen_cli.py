@@ -20,7 +20,9 @@
 
 import click
 import sys
-from omen_logic import FanController, OMEN_FAN_DIR, TEMP_SOURCES, DEFAULT_TEMP_SOURCE, DEFAULT_SPIKE_WINDOW
+from omen_logic import (FanController, FanCleaner, OMEN_FAN_DIR, TEMP_SOURCES, DEFAULT_TEMP_SOURCE, DEFAULT_SPIKE_WINDOW,
+                        DEFAULT_CLEANER_DURATION, DEFAULT_CLEANER_SPEED, DEFAULT_CLEANER_INTERVAL_HOURS,
+                        CLEANER_DURATION_RANGE, CLEANER_SPEED_RANGE, DEFAULT_CLEANER_WINDOW)
 
 class ShowableChoice(click.Choice):
     """click.Choice that also accepts the 'show' sentinel used by flag_value,
@@ -325,6 +327,8 @@ def serve():
     click.echo("Starting Omen Fan Control Daemon...")
     
     curve_ctl = controller.make_curve_controller()
+    cleaner = controller.make_fan_cleaner()
+    FanCleaner.take_request()   # drop a request left over from before the restart
     last_config_mtime = 0
     last_source = None
     
@@ -344,6 +348,17 @@ def serve():
             if mode == "calibration":
                 time.sleep(1)
                 continue
+
+            # Fan cleaning: on request (GUI/CLI) or on the periodic schedule.
+            # Runs inline so nothing else writes pwm meanwhile.
+            req = FanCleaner.take_request()
+            if req is None and cleaner.auto_due():
+                req = {"auto": True}
+            if req is not None:
+                click.echo("Fan cleaning: " + ("scheduled run" if req.get("auto") else "run requested"))
+                ok, msg = cleaner.run_blocking(req.get("duration"), req.get("speed"))
+                click.echo(f"Fan cleaning: {msg}")
+                curve_ctl.request_reapply()
             
             if mode == "curve":
                 source = controller.config.get("temp_source", DEFAULT_TEMP_SOURCE)
@@ -439,7 +454,13 @@ def stress(duration):
 @click.option('--curve-interpolation', type=ShowableChoice(['smooth', 'discrete']), required=False, is_flag=False, flag_value='show', help="Curve interpolation mode. No arg shows current.")
 @click.option('--enable-experimental', type=ShowableChoice(['on', 'off']), required=False, is_flag=False, flag_value='show', help="Enable experimental board support. No arg shows current.")
 @click.option('--thermal-profile', type=ShowableChoice(['omen', 'victus', 'victus_s']), required=False, is_flag=False, flag_value='show', help="Set thermal profile for exp. support. No arg shows current.")
-def options(wait_time, watchdog, ma_window, temp_source, spike_window, bypass_warning, curve_interpolation, enable_experimental, thermal_profile):
+@click.option('--cleaner-auto', type=ShowableChoice(['on', 'off']), required=False, is_flag=False, flag_value='show', help="Periodic fan cleaning by the service. No arg shows current.")
+@click.option('--cleaner-interval', type=str, required=False, is_flag=False, flag_value='show', help="Time between automatic cleanings: hours, or 7d / 2w / 1m. No arg shows current.")
+@click.option('--cleaner-window', type=str, required=False, is_flag=False, flag_value='show', help="Hours automatic cleanings may start, e.g. 8-22 (local time), or 'any'. No arg shows current.")
+@click.option('--cleaner-duration', type=int, required=False, is_flag=False, flag_value=-1, help=f"Seconds in reverse per cleaning ({CLEANER_DURATION_RANGE[0]}-{CLEANER_DURATION_RANGE[1]}). No arg shows current.")
+@click.option('--cleaner-speed', type=int, required=False, is_flag=False, flag_value=-1, help=f"Reverse speed in x100 RPM ({CLEANER_SPEED_RANGE[0]}-{CLEANER_SPEED_RANGE[1]}). No arg shows current.")
+def options(wait_time, watchdog, ma_window, temp_source, spike_window, bypass_warning, curve_interpolation, enable_experimental, thermal_profile,
+            cleaner_auto, cleaner_interval, cleaner_window, cleaner_duration, cleaner_speed):
     """
     Configure or view options.
     Run without arguments to view all current settings.
@@ -448,7 +469,8 @@ def options(wait_time, watchdog, ma_window, temp_source, spike_window, bypass_wa
     """
     controller = get_controller()
     
-    if all(x is None for x in [wait_time, watchdog, ma_window, temp_source, spike_window, bypass_warning, curve_interpolation, enable_experimental, thermal_profile]):
+    if all(x is None for x in [wait_time, watchdog, ma_window, temp_source, spike_window, bypass_warning, curve_interpolation, enable_experimental, thermal_profile,
+                               cleaner_auto, cleaner_interval, cleaner_window, cleaner_duration, cleaner_speed]):
         wt = controller.config.get('calibration_wait', 5)
         wd = controller.config.get('watchdog_interval', 90)
         mw = controller.config.get('ma_window', 5)
@@ -469,6 +491,16 @@ def options(wait_time, watchdog, ma_window, temp_source, spike_window, bypass_wa
         click.echo(f"  Curve Interpolation:   {ci} \t--curve-interpolation")
         click.echo(f"  Experimental Support:  {'On' if ee else 'Off'} \t--enable-experimental")
         click.echo(f"  Thermal Profile:       {tp} \t--thermal-profile")
+        ca = controller.config.get('cleaner_auto', False)
+        ci = controller.config.get('cleaner_interval_hours', DEFAULT_CLEANER_INTERVAL_HOURS)
+        cd = controller.config.get('cleaner_duration', DEFAULT_CLEANER_DURATION)
+        cs = controller.config.get('cleaner_speed', DEFAULT_CLEANER_SPEED)
+        click.echo(f"  Auto Fan Cleaning:     {'On' if ca else 'Off'} \t--cleaner-auto")
+        cw = window_text(controller.config)
+        click.echo(f"  Cleaning Interval:     {FanCleaner.format_interval(float(ci))} \t--cleaner-interval")
+        click.echo(f"  Cleaning Hours:        {cw} \t--cleaner-window")
+        click.echo(f"  Cleaning Duration:     {cd}s \t--cleaner-duration")
+        click.echo(f"  Cleaning Speed:        {cs * 100} RPM \t--cleaner-speed")
         return
 
     changed = False
@@ -563,6 +595,72 @@ def options(wait_time, watchdog, ma_window, temp_source, spike_window, bypass_wa
              controller.config['curve_interpolation'] = curve_interpolation
              changed = True
              click.echo(f"Curve Interpolation set to {curve_interpolation}")
+
+    if cleaner_auto is not None:
+        if cleaner_auto == 'show':
+            val = controller.config.get('cleaner_auto', False)
+            click.echo(f"Current Auto Fan Cleaning: {'On' if val else 'Off'}")
+        else:
+            is_on = (cleaner_auto == 'on')
+            controller.config['cleaner_auto'] = is_on
+            changed = True
+            click.echo(f"Auto Fan Cleaning set to {'On' if is_on else 'Off'}"
+                       + (" (the service runs it; the first run is one interval from now)" if is_on else ""))
+
+    if cleaner_interval is not None:
+        if cleaner_interval == 'show':
+            val = controller.config.get('cleaner_interval_hours', DEFAULT_CLEANER_INTERVAL_HOURS)
+            click.echo(f"Current Cleaning Interval: {FanCleaner.format_interval(float(val))} ({val:g}h)")
+        else:
+            hours = FanCleaner.parse_interval(cleaner_interval)
+            if hours and hours >= 1:
+                controller.config['cleaner_interval_hours'] = hours
+                changed = True
+                click.echo(f"Cleaning Interval set to {FanCleaner.format_interval(hours)} ({hours:g}h)")
+            else:
+                click.echo("Error: interval must be at least 1 hour: e.g. 36, 36h, 7d, 2w, 1m.")
+
+    if cleaner_window is not None:
+        if cleaner_window == 'show':
+            click.echo(f"Current Cleaning Hours: {window_text(controller.config)}")
+        else:
+            import re
+            m = re.fullmatch(r"\s*(\d{1,2})\s*-\s*(\d{1,2})\s*", cleaner_window)
+            if cleaner_window.strip().lower() in ('any', 'off', 'always'):
+                controller.config['cleaner_window_start'] = controller.config['cleaner_window_end'] = 0
+                changed = True
+                click.echo("Cleaning Hours: any time")
+            elif m and 0 <= int(m.group(1)) <= 23 and 0 <= int(m.group(2)) <= 23:
+                controller.config['cleaner_window_start'] = int(m.group(1))
+                controller.config['cleaner_window_end'] = int(m.group(2))
+                changed = True
+                click.echo(f"Cleaning Hours set to {window_text(controller.config)}")
+            else:
+                click.echo("Error: use START-END with hours 0-23 (e.g. 8-22, 22-6 wraps midnight) or 'any'.")
+
+    if cleaner_duration is not None:
+        lo, hi = CLEANER_DURATION_RANGE
+        if cleaner_duration == -1:
+            val = controller.config.get('cleaner_duration', DEFAULT_CLEANER_DURATION)
+            click.echo(f"Current Cleaning Duration: {val}s")
+        elif lo <= cleaner_duration <= hi:
+            controller.config['cleaner_duration'] = cleaner_duration
+            changed = True
+            click.echo(f"Cleaning Duration set to {cleaner_duration}s")
+        else:
+            click.echo(f"Error: Cleaning duration must be {lo}-{hi}s.")
+
+    if cleaner_speed is not None:
+        lo, hi = CLEANER_SPEED_RANGE
+        if cleaner_speed == -1:
+            val = controller.config.get('cleaner_speed', DEFAULT_CLEANER_SPEED)
+            click.echo(f"Current Cleaning Speed: {val} ({val * 100} RPM)")
+        elif lo <= cleaner_speed <= hi:
+            controller.config['cleaner_speed'] = cleaner_speed
+            changed = True
+            click.echo(f"Cleaning Speed set to {cleaner_speed} ({cleaner_speed * 100} RPM)")
+        else:
+            click.echo(f"Error: Cleaning speed must be {lo}-{hi} (x100 RPM).")
         
     if changed:
         controller.save_config()
@@ -644,6 +742,109 @@ def curves_export(name, csv_path):
         click.echo(f"Wrote {len(pts)} points to {csv_path}")
     else:
         click.echo("\n".join(lines))
+
+def window_text(cfg):
+    a = int(cfg.get('cleaner_window_start', DEFAULT_CLEANER_WINDOW[0]))
+    b = int(cfg.get('cleaner_window_end', DEFAULT_CLEANER_WINDOW[1]))
+    return "any time" if a == b else f"{a:02d}:00-{b:02d}:00"
+
+@cli.group()
+def clean():
+    """Fan cleaning: spin the fans backwards to blow dust out (needs acpi_call)"""
+    pass
+
+@clean.command('run')
+@click.option('--duration', type=int, help=f"Seconds in reverse ({CLEANER_DURATION_RANGE[0]}-{CLEANER_DURATION_RANGE[1]}). Default: config.")
+@click.option('--speed', type=int, help=f"Reverse speed in x100 RPM ({CLEANER_SPEED_RANGE[0]}-{CLEANER_SPEED_RANGE[1]}). Default: config.")
+def clean_run(duration, speed):
+    """Run one cleaning cycle now (through the service if it is running)"""
+    import time
+    controller = get_controller()
+    cleaner = controller.make_fan_cleaner()
+    caps = cleaner.capabilities()
+    if caps["mode"] is None:
+        click.echo(click.style(f"Fan cleaning not available: {caps['error'] or 'not supported by this board'}", fg="red"))
+        if not cleaner.acpi_call_available():
+            click.echo("Load the acpi_call module: sudo modprobe acpi_call  (package: acpi_call-dkms)")
+        sys.exit(1)
+    if cleaner.is_running():
+        click.echo("A fan cleaning run is already in progress.")
+        sys.exit(1)
+
+    def show(state):
+        phase = state.get("phase", "")
+        rpm, rev = controller.get_fan_state(1)
+        print(f"  {phase:<12} {state.get('progress', 0):3d}%   {'-' if rev else ''}{rpm} RPM     ", end="\r")
+
+    if controller.is_service_running():
+        FanCleaner.request(duration, speed)
+        click.echo("Requested fan cleaning from the service...")
+        t0 = time.time()
+        while not cleaner.is_running():
+            if time.time() - t0 > 10:
+                click.echo("The service did not start the cleaning (is it running the latest version?).")
+                sys.exit(1)
+            time.sleep(0.5)
+        while cleaner.is_running():
+            show(cleaner.read_state())
+            time.sleep(0.5)
+        state = cleaner.read_state()
+        ok, msg = state.get("last_ok", False), state.get("last_status", "")
+    else:
+        gen = cleaner.run(duration, speed)
+        try:
+            while True:
+                next(gen)
+                show(cleaner.read_state())
+        except StopIteration as e:
+            ok, msg = e.value
+        except KeyboardInterrupt:
+            # the generator's finally block has already released the fans
+            ok, msg = False, "Interrupted; fans handed back to the EC."
+        controller.restore_configured_mode()
+    click.echo("")
+    click.echo(click.style(msg, fg="green" if ok else "red"))
+    sys.exit(0 if ok else 1)
+
+@clean.command('stop')
+def clean_stop():
+    """Abort the cleaning run in progress"""
+    controller = get_controller()
+    cleaner = controller.make_fan_cleaner()
+    if not cleaner.is_running():
+        click.echo("No fan cleaning run in progress.")
+        return
+    FanCleaner.request_stop()
+    click.echo("Stop requested; the fans are being handed back to the EC.")
+
+@clean.command('status')
+def clean_status():
+    """Show fan cleaning support, settings and last run"""
+    import datetime
+    controller = get_controller()
+    cleaner = controller.make_fan_cleaner()
+    caps = cleaner.capabilities()
+    if caps["mode"]:
+        fans = ", ".join(n for n, ok in (("CPU", caps["cpu"]), ("GPU", caps["gpu"]), ("fan3", caps["fan3"])) if ok) or "-"
+        click.echo(f"Support:           {click.style(caps['mode'], fg='green')} (fans: {fans})")
+    else:
+        click.echo(f"Support:           {click.style('not available', fg='red')} ({caps['error'] or 'not supported by this board'})")
+    cfg = controller.config
+    click.echo(f"Duration / Speed:  {cfg.get('cleaner_duration', DEFAULT_CLEANER_DURATION)}s / {cfg.get('cleaner_speed', DEFAULT_CLEANER_SPEED) * 100} RPM")
+    auto = cfg.get('cleaner_auto', False)
+    if auto:
+        click.echo(f"Automatic:         {FanCleaner.format_interval(float(cfg.get('cleaner_interval_hours', DEFAULT_CLEANER_INTERVAL_HOURS)))}, "
+                   f"between {window_text(cfg)} (service)")
+    else:
+        click.echo("Automatic:         off")
+    state = cleaner.read_state()
+    fmt = lambda ts: datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "never"
+    if cleaner.is_running():
+        click.echo(f"Now:               running ({state.get('phase')}, {state.get('progress', 0)}%)")
+    click.echo(f"Last run:          {fmt(state.get('last_run'))}" + (f" - {state.get('last_status')}" if state.get('last_status') else ""))
+    nxt = cleaner.next_auto_time()
+    if nxt:
+        click.echo(f"Next automatic:    {fmt(nxt)}")
 
 @cli.group()
 def service():
@@ -729,8 +930,8 @@ def status():
     click.echo(f"Driver Mode:       {mode}")
     
     # 3. Fan Speed
-    rpm = controller.get_fan_speed()
-    click.echo(f"Fan Speed:         {rpm} RPM")
+    rpm, reverse = controller.get_fan_state(1)
+    click.echo(f"Fan Speed:         {rpm} RPM" + (click.style("  (reverse - cleaning)", fg="cyan") if reverse else ""))
     
     # 4. Temperatures
     pkg_temp = controller.get_cpu_temp()
@@ -775,11 +976,18 @@ def enable_bios():
 @click.option('--curve-interpolation', type=ShowableChoice(['smooth', 'discrete']), required=False, is_flag=False, flag_value='show', help="Curve interpolation mode. No arg shows current.")
 @click.option('--enable-experimental', type=ShowableChoice(['on', 'off']), required=False, is_flag=False, flag_value='show', help="Enable experimental board support. No arg shows current.")
 @click.option('--thermal-profile', type=ShowableChoice(['omen', 'victus', 'victus_s']), required=False, is_flag=False, flag_value='show', help="Set thermal profile for exp. support. No arg shows current.")
+@click.option('--cleaner-auto', type=ShowableChoice(['on', 'off']), required=False, is_flag=False, flag_value='show', help="Periodic fan cleaning by the service. No arg shows current.")
+@click.option('--cleaner-interval', type=str, required=False, is_flag=False, flag_value='show', help="Time between automatic cleanings: hours, or 7d / 2w / 1m. No arg shows current.")
+@click.option('--cleaner-window', type=str, required=False, is_flag=False, flag_value='show', help="Hours automatic cleanings may start, e.g. 8-22 (local time), or 'any'. No arg shows current.")
+@click.option('--cleaner-duration', type=int, required=False, is_flag=False, flag_value=-1, help=f"Seconds in reverse per cleaning ({CLEANER_DURATION_RANGE[0]}-{CLEANER_DURATION_RANGE[1]}). No arg shows current.")
+@click.option('--cleaner-speed', type=int, required=False, is_flag=False, flag_value=-1, help=f"Reverse speed in x100 RPM ({CLEANER_SPEED_RANGE[0]}-{CLEANER_SPEED_RANGE[1]}). No arg shows current.")
 @click.pass_context
-def settings(ctx, wait_time, watchdog, ma_window, temp_source, spike_window, bypass_warning, curve_interpolation, enable_experimental, thermal_profile):
+def settings(ctx, wait_time, watchdog, ma_window, temp_source, spike_window, bypass_warning, curve_interpolation, enable_experimental, thermal_profile,
+             cleaner_auto, cleaner_interval, cleaner_window, cleaner_duration, cleaner_speed):
     """Alias for options"""
     ctx.invoke(options, wait_time=wait_time, watchdog=watchdog, ma_window=ma_window, temp_source=temp_source, spike_window=spike_window,
-               bypass_warning=bypass_warning, curve_interpolation=curve_interpolation, enable_experimental=enable_experimental, thermal_profile=thermal_profile)
+               bypass_warning=bypass_warning, curve_interpolation=curve_interpolation, enable_experimental=enable_experimental, thermal_profile=thermal_profile,
+               cleaner_auto=cleaner_auto, cleaner_interval=cleaner_interval, cleaner_window=cleaner_window, cleaner_duration=cleaner_duration, cleaner_speed=cleaner_speed)
 
 @cli.command()
 def license():

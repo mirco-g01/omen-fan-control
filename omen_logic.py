@@ -20,6 +20,8 @@ import os
 
 import glob
 import json
+import re
+import struct
 import time
 import math
 import shutil
@@ -50,6 +52,24 @@ DEFAULT_CURVE_NAME = "Default"
 # of the target, but re-apply at least every HYSTERESIS_REAPPLY_SECS.
 HYSTERESIS_RPM = 200
 HYSTERESIS_REAPPLY_SECS = 60
+# Fan cleaning (reverse spin, the OMEN Gaming Hub "Fan cleaning" routine).
+# Speeds are in units of 100 RPM, like the WMI fan speed byte.
+ACPI_CALL_PATH = Path("/proc/acpi/call")
+CLEANER_STATE_FILE = CONFIG_DIR / "cleaner_state.json"
+CLEANER_REQUEST_FILE = CONFIG_DIR / "cleaner.request"
+CLEANER_STOP_FILE = CONFIG_DIR / "cleaner.stop"
+DEFAULT_CLEANER_DURATION = 30
+CLEANER_DURATION_RANGE = (10, 90)      # the EC drops user fan control after 120s
+DEFAULT_CLEANER_SPEED = 37
+CLEANER_SPEED_RANGE = (10, 60)
+DEFAULT_CLEANER_INTERVAL_HOURS = 168           # weekly
+CLEANER_INTERVAL_PRESETS = (("day", 24), ("3 days", 72), ("week", 168), ("2 weeks", 336), ("month", 720))
+# Automatic runs only start between these hours (local time); equal = any time
+DEFAULT_CLEANER_WINDOW = (8, 22)
+CLEANER_MAX_TEMP = 75                  # °C, refuse/abort above this
+CLEANER_SOFT_START_PWM = 35
+CLEANER_AUTO_RETRY_SECS = 600          # auto clean postponed (hot / on battery): retry after
+FAN_REVERSE_FLAG = 0x80
 OMEN_FAN_DIR = Path(__file__).parent.absolute()
 CONFIG_VERSION = 1
 
@@ -133,12 +153,14 @@ class FanController:
             self.pwm1_enable_path = None
             self.pwm1_path = None
             self.fan1_input_path = None
+            self.fan2_input_path = None
             return
 
         self.hwmon_path = Path(paths[0])
         self.pwm1_enable_path = self.hwmon_path / "pwm1_enable"
         self.pwm1_path = self.hwmon_path / "pwm1"
         self.fan1_input_path = self.hwmon_path / "fan1_input"
+        self.fan2_input_path = self.hwmon_path / "fan2_input"
         self.cpu_temp_path = self._find_cpu_temp_path()
 
     def _find_cpu_temp_path(self):
@@ -186,7 +208,13 @@ class FanController:
             "enable_experimental": False,
             "thermal_profile": "omen",
             "cached_board_name": None,
-            "debug_experimental_ui": False
+            "debug_experimental_ui": False,
+            "cleaner_auto": False,
+            "cleaner_interval_hours": DEFAULT_CLEANER_INTERVAL_HOURS,
+            "cleaner_window_start": DEFAULT_CLEANER_WINDOW[0],
+            "cleaner_window_end": DEFAULT_CLEANER_WINDOW[1],
+            "cleaner_duration": DEFAULT_CLEANER_DURATION,
+            "cleaner_speed": DEFAULT_CLEANER_SPEED,
         }
         
         if not self.config_path.exists():
@@ -305,13 +333,59 @@ class FanController:
             print(f"Error reading {path}: {e}")
             return None
 
+    @staticmethod
+    def parse_fan_rpm(val):
+        """fanN_input is the raw EC speed byte * 100; bit 7 of that byte means
+        the fan is spinning backwards (fan cleaning). Returns (rpm, reverse)."""
+        try:
+            raw = int(val)
+        except (TypeError, ValueError):
+            return 0, False
+        if raw >= FAN_REVERSE_FLAG * 100:
+            return ((raw // 100) & (FAN_REVERSE_FLAG - 1)) * 100, True
+        return raw, False
+
+    def get_fan_state(self, fan=1):
+        """Returns (rpm, reverse) of fan 1 or 2."""
+        path = self.fan1_input_path if fan == 1 else self.fan2_input_path
+        return self.parse_fan_rpm(self.read_sys_file(path))
+
     def get_fan_speed(self):
-        """Returns current fan speed in RPM."""
+        """Returns current fan speed in RPM (direction stripped)."""
         val = self.read_sys_file(self.fan1_input_path)
         if not val:
             print("Failed to read fan speed")
             return 0
-        return int(val)
+        return self.parse_fan_rpm(val)[0]
+
+    def is_on_ac_power(self):
+        """True if a mains adapter reports online (or nothing can be read)."""
+        found = False
+        for sup in Path("/sys/class/power_supply").glob("*"):
+            try:
+                if (sup / "type").read_text().strip() != "Mains":
+                    continue
+                found = True
+                if (sup / "online").read_text().strip() == "1":
+                    return True
+            except Exception:
+                continue
+        return not found
+
+    def restore_configured_mode(self):
+        """Re-applies the mode saved in the config once (used after a fan
+        cleaning run when no service is there to do it)."""
+        mode = self.config.get("mode", "auto")
+        if mode == "curve":
+            ctl = self.make_curve_controller()
+            ctl.request_reapply()
+            ctl.step()
+        elif mode == "manual":
+            self.set_fan_pwm(self.config.get("manual_pwm", 0))
+        elif mode == "max":
+            self.set_fan_mode("max")
+        else:
+            self.set_fan_mode("auto")
 
     def get_cpu_temp(self):
         """Returns CPU temp in Celsius."""
@@ -426,6 +500,9 @@ class FanController:
 
     def make_curve_controller(self):
         return CurveController(self)
+
+    def make_fan_cleaner(self):
+        return FanCleaner(self)
 
     def calibrate(self):
         """Runs calibration routine. Yields progress (0-100), returns max RPM."""
@@ -944,10 +1021,16 @@ class CurveController:
         self.controller = controller
         self.estimator = TempEstimator(controller)
         self.hysteresis_start_time = None
+        self.force_apply = False
 
     def reset(self):
         self.estimator.reset()
         self.hysteresis_start_time = None
+
+    def request_reapply(self):
+        """Write pwm on the next step even if within the hysteresis band
+        (the fan state was changed behind our back, e.g. by fan cleaning)."""
+        self.force_apply = True
 
     def step(self):
         """Returns (estimate_dict, target_pwm, applied)."""
@@ -968,7 +1051,444 @@ class CurveController:
             else:
                 self.hysteresis_start_time = None
 
+        if self.force_apply:
+            should_apply = True
+            self.force_apply = False
+
         if should_apply:
             self.controller.set_fan_pwm(target_pwm)
             self.hysteresis_start_time = None
         return est, target_pwm, should_apply
+
+
+class FanCleaner:
+    """
+    Reverse-spin fan cleaning, the routine OMEN Gaming Hub runs on Windows to
+    blow dust out of the heatsinks.
+
+    The EC takes the same WMI command the hp-wmi driver uses for a manual fan
+    speed (GM command 0x2E: one byte per fan, in units of 100 RPM); setting
+    bit 7 of a byte spins that fan backwards. The driver does not expose that
+    bit, so the command is sent through the acpi_call module instead. A run
+    is: hand the fans to the EC, brake (reverse bit, speed 0) until they stop,
+    spin backwards for `duration` seconds, decelerate, release the override
+    and soft-start forward. Older boards use a flag in a 4 byte EC record
+    ("legacy", untested here).
+
+    One run at a time: the state file tells other processes (GUI, CLI) what
+    the daemon is doing, the request file asks the daemon to run, the stop
+    file aborts whichever process is running.
+    """
+    WMI_GM = 0x20008
+    FAN_STATE_QUERY = 0x2C     # GM read: [cpu, gpu, fan3, ...,  caps at byte 8]
+    FAN_SPEED_SET = 0x2E       # GM write: [cpu, gpu, fan3]
+    FAN_COUNT_QUERY = 0x10     # GM read, keeps the EC in user-defined fan state
+    LEGACY_QUERY = 0x2C        # READ/WRITE 4 byte record, bit 0x20 of byte 0 = supported
+    BRAKE_TIMEOUT = 7.0
+    STOPPED_RPM = 300
+
+    def __init__(self, controller):
+        self.controller = controller
+        self._caps = None
+
+    # --- acpi_call plumbing -------------------------------------------------
+    @staticmethod
+    def acpi_call_available():
+        return ACPI_CALL_PATH.exists()
+
+    def _wmi(self, command, ctype, data, outsize, datasize=None):
+        """Runs \\_SB.WMID.WMAA with an HP bios_args buffer (same layout the
+        driver builds in hp_wmi_perform_query: the data area is always at
+        least 128 bytes). Returns the bytes after the 8 byte (signature,
+        return code) header; raises on any WMI error."""
+        if not self.acpi_call_available():
+            raise RuntimeError("acpi_call module not loaded (/proc/acpi/call missing)")
+        # method id encodes the expected output size, see hp-wmi.c
+        method = 1 if outsize == 0 else 2 if outsize <= 4 else 3
+        if datasize is None:
+            datasize = max(len(data), outsize)
+        buf = struct.pack("<4sIII", b"SECU", command, ctype, datasize) + bytes(data).ljust(max(datasize, 128), b"\0")
+        with open(ACPI_CALL_PATH, "w") as f:
+            f.write(f"\\_SB.WMID.WMAA 0 {method} b{buf.hex()}")
+        with open(ACPI_CALL_PATH) as f:
+            resp = f.read().strip().replace("\x00", "")
+        if not resp or resp.startswith("Error"):
+            raise RuntimeError(f"acpi_call failed: {resp or 'empty response'}")
+        tokens = re.findall(r"0x[0-9a-fA-F]+", resp)
+        raw = bytes(int(t, 16) & 0xFF for t in tokens) if tokens else bytes.fromhex(re.sub(r"[^0-9a-fA-F]", "", resp))
+        if len(raw) < 8:
+            raise RuntimeError(f"WMI response too short: {resp[:60]}")
+        sig, code = raw[:4], struct.unpack("<I", raw[4:8])[0]
+        if sig != b"PASS" or code != 0:
+            raise RuntimeError(f"WMI {ctype:#x} returned {sig.decode(errors='ignore')} code {code}")
+        return raw[8:]
+
+    def _read_state(self):
+        return self._wmi(self.WMI_GM, self.FAN_STATE_QUERY, b"", 128)
+
+    def _write_speeds(self, cpu, gpu, fan3=0):
+        self._wmi(self.WMI_GM, self.FAN_SPEED_SET, bytes([cpu, gpu, fan3]), 128)
+
+    def _write_reverse(self, speed, fan3):
+        """speed 0 = brake in reverse; fan3 only if the board reports one."""
+        b = FAN_REVERSE_FLAG | speed
+        self._write_speeds(b, b, b if fan3 else 0)
+
+    # --- capabilities -------------------------------------------------------
+    def capabilities(self, refresh=False):
+        """{"mode": "modern"|"legacy"|None, "cpu", "gpu", "fan3", "error"}"""
+        if self._caps is not None and not refresh:
+            return self._caps
+        caps = {"mode": None, "cpu": False, "gpu": False, "fan3": False, "error": None}
+        if not self.acpi_call_available():
+            caps["error"] = "acpi_call module not loaded"
+            self._caps = caps
+            return caps
+        try:
+            data = self._read_state()
+            if len(data) > 8:
+                caps["cpu"], caps["gpu"], caps["fan3"] = bool(data[8] & 1), bool(data[8] & 2), bool(data[8] & 4)
+                if caps["cpu"] or caps["gpu"] or caps["fan3"]:
+                    caps["mode"] = "modern"
+        except Exception as e:
+            caps["error"] = str(e)
+        if caps["mode"] is None:
+            try:
+                data = self._wmi(1, self.LEGACY_QUERY, b"", 4)   # HPWMI_READ
+                if data and data[0] & 0x20:
+                    caps["mode"] = "legacy"
+                    caps["error"] = None
+            except Exception as e:
+                caps["error"] = caps["error"] or str(e)
+        self._caps = caps
+        return caps
+
+    def is_supported(self):
+        return self.capabilities()["mode"] is not None
+
+    def is_reversing(self):
+        return self.controller.get_fan_state(1)[1] or self.controller.get_fan_state(2)[1]
+
+    # --- state / request files ---------------------------------------------
+    @staticmethod
+    def read_state():
+        try:
+            with open(CLEANER_STATE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    @classmethod
+    def _update_state(cls, **fields):
+        state = cls.read_state()
+        state.update(fields)
+        try:
+            CLEANER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = CLEANER_STATE_FILE.with_suffix(".tmp")
+            with open(tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp, CLEANER_STATE_FILE)
+        except Exception as e:
+            print(f"Error writing cleaner state: {e}")
+        return state
+
+    @staticmethod
+    def is_running():
+        """True while some process is in a run. A "running" state left behind
+        by a crashed process (dead pid, or far past its duration) is ignored."""
+        state = FanCleaner.read_state()
+        if state.get("state") != "running":
+            return False
+        if time.time() - state.get("started", 0) > state.get("duration", 0) + 60:
+            return False
+        pid = state.get("pid")
+        if pid:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                pass
+        return True
+
+    @staticmethod
+    def request(duration=None, speed=None):
+        """Asks the running daemon to clean (it polls for this file)."""
+        CLEANER_REQUEST_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(CLEANER_REQUEST_FILE, "w") as f:
+            json.dump({"ts": time.time(), "duration": duration, "speed": speed}, f)
+
+    @staticmethod
+    def take_request():
+        """Daemon side: returns and removes a pending request, or None."""
+        if not CLEANER_REQUEST_FILE.exists():
+            return None
+        try:
+            with open(CLEANER_REQUEST_FILE) as f:
+                req = json.load(f)
+        except Exception:
+            req = {}
+        try:
+            CLEANER_REQUEST_FILE.unlink()
+        except Exception:
+            pass
+        return req
+
+    @staticmethod
+    def request_stop():
+        CLEANER_STOP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CLEANER_STOP_FILE.touch()
+
+    @staticmethod
+    def _stop_requested():
+        if CLEANER_STOP_FILE.exists():
+            try:
+                CLEANER_STOP_FILE.unlink()
+            except Exception:
+                pass
+            return True
+        return False
+
+    # --- automatic schedule ------------------------------------------------
+    @staticmethod
+    def parse_interval(text):
+        """'36' / '36h' / '7d' / '2w' / '1m' -> hours (float), or None."""
+        m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([hdwm]?)\s*", str(text).lower())
+        if not m:
+            return None
+        n, unit = float(m.group(1)), m.group(2)
+        return n * {"": 1, "h": 1, "d": 24, "w": 168, "m": 720}[unit]
+
+    @staticmethod
+    def format_interval(hours):
+        for label, h in CLEANER_INTERVAL_PRESETS:
+            if abs(hours - h) < 1e-6:
+                return f"every {label}"
+        if hours % 24 == 0:
+            return f"every {int(hours // 24)} days"
+        return f"every {hours:g} hours"
+
+    def _window(self):
+        cfg = self.controller.config
+        try:
+            a = int(cfg.get("cleaner_window_start", DEFAULT_CLEANER_WINDOW[0])) % 24
+            b = int(cfg.get("cleaner_window_end", DEFAULT_CLEANER_WINDOW[1])) % 24
+        except (TypeError, ValueError):
+            a, b = DEFAULT_CLEANER_WINDOW
+        return a, b
+
+    def in_window(self, ts=None):
+        """True if the allowed-hours window contains ts (local time). A window
+        like 22-6 wraps past midnight; start == end means no restriction."""
+        a, b = self._window()
+        if a == b:
+            return True
+        h = time.localtime(ts if ts is not None else time.time()).tm_hour
+        return a <= h < b if a < b else (h >= a or h < b)
+
+    def next_window_start(self, ts):
+        """Earliest time >= ts inside the window (ts itself if already inside)."""
+        if self.in_window(ts):
+            return ts
+        a, _ = self._window()
+        lt = time.localtime(ts)
+        day_start = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, a, 0, 0, 0, 0, -1))
+        return day_start if day_start > ts else day_start + 86400
+
+    def next_auto_time(self):
+        """When the next automatic run would start, or None if auto is off /
+        not armed yet. Postponements (hot, battery) are not predictable."""
+        cfg = self.controller.config
+        if not cfg.get("cleaner_auto", False):
+            return None
+        state = self.read_state()
+        base = state.get("last_run") or state.get("auto_armed")
+        if not base:
+            return None
+        interval = max(1, float(cfg.get("cleaner_interval_hours", DEFAULT_CLEANER_INTERVAL_HOURS))) * 3600
+        return self.next_window_start(max(base + interval, time.time()))
+
+    def auto_due(self):
+        """Daemon side: True when the periodic cleaning should run now. The
+        first check after enabling auto only starts the countdown."""
+        cfg = self.controller.config
+        if not cfg.get("cleaner_auto", False):
+            return False
+        interval = max(1, float(cfg.get("cleaner_interval_hours", DEFAULT_CLEANER_INTERVAL_HOURS))) * 3600
+        state = self.read_state()
+        last = state.get("last_run") or state.get("auto_armed")
+        if not last:
+            self._update_state(auto_armed=time.time())
+            return False
+        if time.time() - last < interval:
+            return False
+        if not self.in_window():
+            return False
+        if time.time() - state.get("auto_postponed", 0) < CLEANER_AUTO_RETRY_SECS:
+            return False
+        if not self.controller.is_on_ac_power() or self.controller.get_core_mean_temp() > CLEANER_MAX_TEMP:
+            self._update_state(auto_postponed=time.time())
+            return False
+        return True
+
+    # --- the run ------------------------------------------------------------
+    def run_blocking(self, duration=None, speed=None):
+        gen = self.run(duration, speed)
+        try:
+            while True:
+                next(gen)
+        except StopIteration as e:
+            return e.value
+
+    def run(self, duration=None, speed=None):
+        """Generator: yields progress 0-100, returns (success, message).
+        On return the fans are spinning forward in driver manual mode at a low
+        speed; the caller restores the configured mode."""
+        cfg = self.controller.config
+        lo, hi = CLEANER_DURATION_RANGE
+        duration = int(min(max(int(duration or cfg.get("cleaner_duration", DEFAULT_CLEANER_DURATION)), lo), hi))
+        lo, hi = CLEANER_SPEED_RANGE
+        speed = int(min(max(int(speed or cfg.get("cleaner_speed", DEFAULT_CLEANER_SPEED)), lo), hi))
+
+        if self.is_running():
+            return False, "A fan cleaning run is already in progress."
+        caps = self.capabilities(refresh=True)
+        if caps["mode"] is None:
+            return False, f"Fan cleaning not available: {caps['error'] or 'not supported by this board'}"
+        if not (self.controller.pwm1_path and self.controller.pwm1_path.exists()):
+            return False, "Fan cleaning needs the patched hp-wmi driver (fan speed readback)."
+        temp = self.controller.get_core_mean_temp()
+        if temp > CLEANER_MAX_TEMP:
+            msg = f"CPU too hot for fan cleaning ({temp:.0f}°C > {CLEANER_MAX_TEMP}°C)."
+            self._update_state(last_status=msg, last_status_ts=time.time(), last_ok=False)
+            return False, msg
+
+        self._stop_requested()   # clear a stale stop file
+        started = time.time()
+        self._update_state(state="running", phase="starting", progress=0, started=started,
+                           duration=duration, speed=speed, pid=os.getpid())
+        print(f"Fan cleaning: {duration}s at {speed * 100} RPM reverse ({caps['mode']})")
+        ok, msg = False, "Fan cleaning failed."
+        try:
+            if caps["mode"] == "legacy":
+                gen = self._run_legacy(duration)
+            else:
+                gen = self._run_modern(duration, speed, caps["fan3"])
+            try:
+                while True:
+                    yield next(gen)
+            except StopIteration as e:
+                ok, msg = e.value
+        except Exception as e:
+            ok, msg = False, f"Fan cleaning aborted: {e}"
+        finally:
+            # whatever happened, leave the EC in charge and the fans forward
+            try:
+                self._release(caps)
+            except Exception as e:
+                print(f"Fan cleaning: release failed: {e}")
+            self._update_state(state="idle", phase="done", progress=100,
+                               last_run=started, last_status=msg, last_status_ts=time.time(), last_ok=ok)
+            print(f"Fan cleaning: {msg}")
+        return ok, msg
+
+    def _phase(self, phase, progress):
+        self._update_state(phase=phase, progress=int(progress))
+        return int(progress)
+
+    def _both_fans(self):
+        r1, rev1 = self.controller.get_fan_state(1)
+        r2, rev2 = self.controller.get_fan_state(2)
+        return r1, rev1, r2, rev2
+
+    def _run_modern(self, duration, speed, fan3):
+        ctl = self.controller
+        # The daemon/GUI is paused while we run; put the driver in auto so its
+        # keep-alive worker cannot re-send a forward speed mid-run.
+        ctl.set_fan_mode("auto")
+        time.sleep(0.3)
+        self._wmi(self.WMI_GM, self.FAN_COUNT_QUERY, bytes([0]), 4, datasize=1)
+
+        # 1. brake: reverse bit with speed 0, wait for the fans to stop
+        yield self._phase("braking", 2)
+        self._write_reverse(0, fan3)
+        t0 = time.time()
+        while True:
+            r1, _, r2, _ = self._both_fans()
+            if r1 < self.STOPPED_RPM and r2 < self.STOPPED_RPM:
+                break
+            if time.time() - t0 > self.BRAKE_TIMEOUT:
+                return False, f"Fans did not stop within {self.BRAKE_TIMEOUT:.0f}s ({r1}/{r2} RPM), reversal cancelled."
+            if self._stop_requested():
+                return False, "Fan cleaning stopped by user."
+            time.sleep(0.3)
+        time.sleep(0.3)
+
+        # 2. reverse for `duration`
+        self._write_reverse(speed, fan3)
+        t0 = time.time()
+        temps = []
+        engaged = False
+        while True:
+            elapsed = time.time() - t0
+            if elapsed >= duration:
+                break
+            yield self._phase("reversing", 5 + 85 * elapsed / duration)
+            if self._stop_requested():
+                return False, "Fan cleaning stopped by user."
+            r1, rev1, r2, rev2 = self._both_fans()
+            if rev1 or rev2:
+                engaged = True
+            elif elapsed > 4.0 and not engaged:
+                return False, "The EC did not engage reverse rotation; this board may not support fan cleaning."
+            temps.append(ctl.get_core_mean_temp())
+            del temps[:-3]
+            if len(temps) == 3 and sum(temps) / 3 > CLEANER_MAX_TEMP:
+                return False, f"Stopped early: CPU reached {sum(temps) / 3:.0f}°C."
+            time.sleep(0.5)
+        return True, f"Fan cleaning completed ({duration}s)."
+
+    def _run_legacy(self, duration):
+        rec = bytearray(self._wmi(1, self.LEGACY_QUERY, b"", 4)[:4])
+        rec[3] |= 0x82
+        self._wmi(2, self.LEGACY_QUERY, bytes(rec), 0)      # HPWMI_WRITE
+        t0 = time.time()
+        while time.time() - t0 < duration:
+            yield self._phase("reversing", 5 + 85 * (time.time() - t0) / duration)
+            if self._stop_requested():
+                return False, "Fan cleaning stopped by user."
+            if self.controller.get_core_mean_temp() > CLEANER_MAX_TEMP:
+                return False, "Stopped early: CPU too hot."
+            time.sleep(0.5)
+        return True, f"Fan cleaning completed ({duration}s)."
+
+    def _release(self, caps):
+        """Decelerate in reverse, give the fans back to the EC, wait for them
+        to stop, then soft-start forward through the driver."""
+        ctl = self.controller
+        self._phase("stopping", 92)
+        if caps["mode"] == "legacy":
+            rec = bytearray(self._wmi(1, self.LEGACY_QUERY, b"", 4)[:4])
+            rec[3] = (rec[3] | 0x02) & 0x7F
+            self._wmi(2, self.LEGACY_QUERY, bytes(rec), 0)
+        else:
+            current = 0
+            try:
+                data = self._read_state()
+                if data[0] & FAN_REVERSE_FLAG:
+                    current = data[0] & (FAN_REVERSE_FLAG - 1)
+            except Exception:
+                pass
+            for s in list(range(current, 0, -5)) + [0]:
+                self._write_reverse(s, caps["fan3"])
+                time.sleep(0.15)
+            self._write_speeds(0, 0, 0)     # back to EC automatic control
+        t0 = time.time()
+        while time.time() - t0 < 4.0:
+            r1, rev1, r2, rev2 = self._both_fans()
+            if not rev1 and not rev2 and r1 < self.STOPPED_RPM and r2 < self.STOPPED_RPM:
+                break
+            time.sleep(0.25)
+        self._phase("soft start", 96)
+        ctl.set_fan_pwm(CLEANER_SOFT_START_PWM)
+        time.sleep(1.0)

@@ -21,6 +21,8 @@ import sys
 import os
 import signal
 import json
+import datetime
+import time
 from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QPushButton, QLabel, QFrame, QStackedWidget,
@@ -29,7 +31,10 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QInputDialog)
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize, QPoint
 from PyQt6.QtGui import QFont, QIcon, QAction, QColor, QPainter, QBrush, QPen
-from omen_logic import FanController, OMEN_FAN_DIR, TEMP_SOURCES, DEFAULT_TEMP_SOURCE, DEFAULT_SPIKE_WINDOW, TempEstimator
+from omen_logic import (FanController, FanCleaner, OMEN_FAN_DIR, TEMP_SOURCES, DEFAULT_TEMP_SOURCE, DEFAULT_SPIKE_WINDOW, TempEstimator,
+                        DEFAULT_CLEANER_DURATION, DEFAULT_CLEANER_SPEED, DEFAULT_CLEANER_INTERVAL_HOURS,
+                        CLEANER_DURATION_RANGE, CLEANER_SPEED_RANGE, CLEANER_MAX_TEMP, CLEANER_INTERVAL_PRESETS,
+                        DEFAULT_CLEANER_WINDOW)
 from fan_curve_widget import FanCurveEditor
 
 class WorkerThread(QThread):
@@ -283,6 +288,7 @@ class MainWindow(QMainWindow):
         self.init_driver_page()
         self.init_options_page()
         self.init_about_page()
+        self.init_cleaning_page()
         
         self.apply_dark_theme()
         
@@ -510,6 +516,7 @@ class MainWindow(QMainWindow):
         
         menu_items = [
             ("Fan Control", self.show_fan_control),
+            ("Fan Cleaning", self.show_cleaning),
             ("Calibration", self.show_calibration),
             ("Driver Management", self.show_driver),
             ("Options", self.show_options),
@@ -1010,6 +1017,299 @@ class MainWindow(QMainWindow):
         
         self.stack.addWidget(page)
 
+    def init_cleaning_page(self):
+        self.cleaning_page = QWidget()
+        layout = QVBoxLayout(self.cleaning_page)
+        layout.addStretch()
+
+        container = QFrame()
+        container.setStyleSheet("background-color: #252526; border-radius: 10px; padding: 15px;")
+        container.setFixedWidth(600)
+        c_layout = QVBoxLayout(container)
+
+        info = QLabel("Spins the fans backwards for a short time to blow dust out of the heatsinks, "
+                      "like the OMEN Gaming Hub \"Fan cleaning\" on Windows. The fans first stop, then run in reverse, "
+                      "then are handed back to the firmware. Cleaning is refused or aborted above "
+                      f"{CLEANER_MAX_TEMP}°C, so run it on an idle machine.")
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #bbb;")
+        c_layout.addWidget(info)
+
+        self.clean_support_lbl = QLabel("")
+        self.clean_support_lbl.setWordWrap(True)
+        c_layout.addWidget(self.clean_support_lbl)
+        c_layout.addSpacing(10)
+
+        row = QHBoxLayout()
+        row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        row.addWidget(QLabel("Duration (s):"))
+        self.clean_duration_spin = QSpinBox()
+        self.clean_duration_spin.setRange(*CLEANER_DURATION_RANGE)
+        self.clean_duration_spin.setSingleStep(5)
+        self.clean_duration_spin.setFixedWidth(80)
+        self.clean_duration_spin.setValue(int(self.controller.config.get("cleaner_duration", DEFAULT_CLEANER_DURATION)))
+        self.clean_duration_spin.valueChanged.connect(self.save_cleaning_options)
+        row.addWidget(self.clean_duration_spin)
+        row.addSpacing(20)
+        row.addWidget(QLabel("Reverse speed:"))
+        self.clean_speed_spin = QSpinBox()
+        self.clean_speed_spin.setRange(CLEANER_SPEED_RANGE[0] * 100, CLEANER_SPEED_RANGE[1] * 100)
+        self.clean_speed_spin.setSingleStep(100)
+        self.clean_speed_spin.setSuffix(" RPM")
+        self.clean_speed_spin.setFixedWidth(110)
+        self.clean_speed_spin.setValue(int(self.controller.config.get("cleaner_speed", DEFAULT_CLEANER_SPEED)) * 100)
+        self.clean_speed_spin.setToolTip("Target reverse speed. The firmware may cap it; the header shows the real RPM (↺ = reverse).")
+        self.clean_speed_spin.valueChanged.connect(self.save_cleaning_options)
+        row.addWidget(self.clean_speed_spin)
+        c_layout.addLayout(row)
+        c_layout.addSpacing(10)
+
+        btn_row = QHBoxLayout()
+        btn_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.clean_start_btn = QPushButton("Start Cleaning")
+        self.clean_start_btn.setFixedWidth(160)
+        self.clean_start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clean_start_btn.setStyleSheet("background-color: #d63333; font-weight: bold; padding: 10px; border-radius: 2px;")
+        self.clean_start_btn.clicked.connect(self.start_cleaning)
+        btn_row.addWidget(self.clean_start_btn)
+        self.clean_stop_btn = QPushButton("Stop")
+        self.clean_stop_btn.setFixedWidth(100)
+        self.clean_stop_btn.setStyleSheet("background-color: #555; padding: 10px; border-radius: 2px;")
+        self.clean_stop_btn.clicked.connect(self.stop_cleaning)
+        self.clean_stop_btn.setEnabled(False)
+        btn_row.addWidget(self.clean_stop_btn)
+        c_layout.addLayout(btn_row)
+
+        self.clean_progress = QProgressBar()
+        self.clean_progress.setRange(0, 100)
+        self.clean_progress.setFixedWidth(400)
+        self.clean_progress.setVisible(False)
+        c_layout.addWidget(self.clean_progress, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self.clean_status_lbl = QLabel("")
+        self.clean_status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.clean_status_lbl.setStyleSheet("color: #ddd; font-size: 14px;")
+        c_layout.addWidget(self.clean_status_lbl)
+        c_layout.addSpacing(15)
+
+        auto_row = QHBoxLayout()
+        auto_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.clean_auto_check = QCheckBox("Clean automatically every")
+        self.clean_auto_check.setChecked(bool(self.controller.config.get("cleaner_auto", False)))
+        self.clean_auto_check.setToolTip("Done by the background service, only on AC power and when the CPU is cool.\n"
+                                         "The first automatic run happens one interval after enabling.")
+        self.clean_auto_check.toggled.connect(self.save_cleaning_options)
+        auto_row.addWidget(self.clean_auto_check)
+        self.clean_interval_combo = QComboBox()
+        self.clean_interval_combo.setItemDelegate(NoFocusDelegate())
+        for label, hours in CLEANER_INTERVAL_PRESETS:
+            self.clean_interval_combo.addItem(label, hours)
+        self.clean_interval_combo.addItem("custom…", None)
+        auto_row.addWidget(self.clean_interval_combo)
+        self.clean_interval_spin = QSpinBox()
+        self.clean_interval_spin.setRange(1, 24 * 90)
+        self.clean_interval_spin.setSuffix(" h")
+        self.clean_interval_spin.setFixedWidth(90)
+        auto_row.addWidget(self.clean_interval_spin)
+        c_layout.addLayout(auto_row)
+
+        cur_hours = float(self.controller.config.get("cleaner_interval_hours", DEFAULT_CLEANER_INTERVAL_HOURS))
+        preset_idx = next((i for i, (_, h) in enumerate(CLEANER_INTERVAL_PRESETS) if abs(h - cur_hours) < 1e-6),
+                          self.clean_interval_combo.count() - 1)
+        self.clean_interval_combo.setCurrentIndex(preset_idx)
+        self.clean_interval_spin.setValue(int(round(cur_hours)))
+        self.clean_interval_spin.setVisible(self.clean_interval_combo.currentData() is None)
+        self.clean_interval_combo.currentIndexChanged.connect(self.on_clean_interval_changed)
+        self.clean_interval_spin.valueChanged.connect(self.save_cleaning_options)
+
+        window_row = QHBoxLayout()
+        window_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        window_row.addWidget(QLabel("Only between"))
+        self.clean_window_start = QSpinBox()
+        self.clean_window_end = QSpinBox()
+        for spin, key, default in ((self.clean_window_start, "cleaner_window_start", DEFAULT_CLEANER_WINDOW[0]),
+                                   (self.clean_window_end, "cleaner_window_end", DEFAULT_CLEANER_WINDOW[1])):
+            spin.setRange(0, 23)
+            spin.setSuffix(":00")
+            spin.setFixedWidth(75)
+            spin.setValue(int(self.controller.config.get(key, default)))
+            spin.valueChanged.connect(self.save_cleaning_options)
+        self.clean_window_start.setToolTip("Automatic runs may only start in this time window (local time).\n"
+                                           "A window like 22:00-06:00 wraps past midnight; equal hours mean any time.")
+        window_row.addWidget(self.clean_window_start)
+        window_row.addWidget(QLabel("and"))
+        window_row.addWidget(self.clean_window_end)
+        self.clean_window_note = QLabel("")
+        self.clean_window_note.setStyleSheet("color: #888;")
+        window_row.addWidget(self.clean_window_note)
+        c_layout.addLayout(window_row)
+
+        self.clean_auto_lbl = QLabel("")
+        self.clean_auto_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.clean_auto_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        c_layout.addWidget(self.clean_auto_lbl)
+
+        layout.addWidget(container, alignment=Qt.AlignmentFlag.AlignCenter)
+        layout.addStretch()
+        self.stack.addWidget(self.cleaning_page)
+
+        self.cleaner = self.controller.make_fan_cleaner()
+        self.clean_thread = None
+        self.clean_watching = False
+        self.clean_requested_at = None
+        self.clean_poll_timer = QTimer()
+        self.clean_poll_timer.timeout.connect(self.refresh_cleaning_state)
+
+    def on_clean_interval_changed(self, *_):
+        custom = self.clean_interval_combo.currentData() is None
+        self.clean_interval_spin.setVisible(custom)
+        self.save_cleaning_options()
+
+    def save_cleaning_options(self, *_):
+        cfg = self.controller.config
+        cfg["cleaner_duration"] = self.clean_duration_spin.value()
+        cfg["cleaner_speed"] = self.clean_speed_spin.value() // 100
+        preset = self.clean_interval_combo.currentData()
+        cfg["cleaner_interval_hours"] = preset if preset is not None else self.clean_interval_spin.value()
+        cfg["cleaner_window_start"] = self.clean_window_start.value()
+        cfg["cleaner_window_end"] = self.clean_window_end.value()
+        self.clean_window_note.setText("(any time)" if cfg["cleaner_window_start"] == cfg["cleaner_window_end"] else "")
+        if self.clean_auto_check.isChecked() and not cfg.get("cleaner_auto", False):
+            # start the countdown now, not from a run months ago
+            FanCleaner._update_state(auto_armed=time.time())
+        cfg["cleaner_auto"] = self.clean_auto_check.isChecked()
+        self.controller.save_config()
+        self.refresh_cleaning_state()
+
+    def refresh_cleaning_support(self):
+        caps = self.cleaner.capabilities(refresh=True)
+        if caps["mode"]:
+            fans = ", ".join(n for n, ok in (("CPU", caps["cpu"]), ("GPU", caps["gpu"]), ("3rd fan", caps["fan3"])) if ok)
+            self.clean_support_lbl.setText(f"Supported on this board ({caps['mode']}" + (f": {fans}" if fans else "") + ").")
+            self.clean_support_lbl.setStyleSheet("color: #4caf50;")
+            self.clean_start_btn.setEnabled(not self.cleaner.is_running())
+        else:
+            why = caps["error"] or "not supported by this board"
+            hint = ""
+            if not self.cleaner.acpi_call_available():
+                hint = "\nInstall and load the acpi_call module:  sudo modprobe acpi_call  (Arch: acpi_call-dkms, Debian: acpi-call-dkms)"
+            elif os.geteuid() != 0:
+                hint = "\nRun the GUI as root."
+            self.clean_support_lbl.setText(f"Not available: {why}.{hint}")
+            self.clean_support_lbl.setStyleSheet("color: #d63333;")
+            self.clean_start_btn.setEnabled(False)
+        self.refresh_cleaning_state()
+
+    def refresh_cleaning_state(self):
+        """Mirrors the cleaner state file (written by whichever process runs
+        the cleaning: this GUI or the service) into the page widgets."""
+        state = FanCleaner.read_state()
+        running = self.cleaner.is_running()
+        if not running and self.clean_requested_at is not None:
+            # asked the service, waiting for it to pick the request up
+            if time.time() - self.clean_requested_at < 10:
+                return
+            self.clean_requested_at = None
+            self.clean_watching = False
+            self.clean_poll_timer.stop()
+            self.status_label.setText("The service did not start the cleaning.")
+            QMessageBox.warning(self, "Fan Cleaning",
+                                "The background service did not pick up the request.\n"
+                                "It is probably running an older version: restart it from Options → Restart Service.")
+        if running:
+            self.clean_requested_at = None
+            phase = state.get("phase", "")
+            rpm, rev = self.controller.get_fan_state(1)
+            self.clean_progress.setVisible(True)
+            self.clean_progress.setValue(int(state.get("progress", 0)))
+            self.clean_status_lbl.setText(f"{phase.capitalize()}… {'-' if rev else ''}{rpm} RPM")
+            self.status_label.setText(f"Cleaning fans ({phase})...")
+            self.clean_start_btn.setEnabled(False)
+            self.clean_stop_btn.setEnabled(True)
+            if not self.clean_poll_timer.isActive():
+                self.clean_poll_timer.start(500)
+            self.clean_watching = True
+        else:
+            if self.clean_watching:
+                # a run we were watching (service side) just finished
+                self.clean_watching = False
+                self.clean_poll_timer.stop()
+                if "Cleaning" in self.status_label.text():
+                    self.status_label.setText(state.get("last_status", "Fan cleaning finished"))
+            self.clean_progress.setVisible(False)
+            self.clean_stop_btn.setEnabled(False)
+            if self.cleaner.capabilities()["mode"] and self.clean_thread is None:
+                self.clean_start_btn.setEnabled(True)
+            last = state.get("last_run")
+            if last:
+                when = datetime.datetime.fromtimestamp(last).strftime("%Y-%m-%d %H:%M")
+                ok = state.get("last_ok", False)
+                self.clean_status_lbl.setText(f"Last run: {when} — {state.get('last_status', '')}")
+                self.clean_status_lbl.setStyleSheet(f"color: {'#4caf50' if ok else '#e65100'}; font-size: 13px;")
+            else:
+                self.clean_status_lbl.setText("Never run.")
+                self.clean_status_lbl.setStyleSheet("color: #888; font-size: 13px;")
+
+        cfg = self.controller.config
+        if cfg.get("cleaner_auto", False):
+            nxt = self.cleaner.next_auto_time()
+            if not self.controller.is_service_running():
+                self.clean_auto_lbl.setText("Automatic cleaning needs the background service (Options → Install Service).")
+            elif nxt:
+                self.clean_auto_lbl.setText("Next automatic cleaning: " + datetime.datetime.fromtimestamp(nxt).strftime("%a %Y-%m-%d %H:%M")
+                                            + "  (skipped while on battery or hot, retried later)")
+            else:
+                self.clean_auto_lbl.setText("Automatic cleaning armed.")
+        else:
+            self.clean_auto_lbl.setText("")
+
+    def start_cleaning(self):
+        if self.cleaner.is_running():
+            return
+        temp = self.controller.get_core_mean_temp()
+        if temp > CLEANER_MAX_TEMP:
+            QMessageBox.warning(self, "Fan Cleaning", f"CPU too hot ({temp:.0f}°C > {CLEANER_MAX_TEMP}°C). Let it cool down first.")
+            return
+        self.clean_start_btn.setEnabled(False)
+        self.clean_stop_btn.setEnabled(True)
+        self.clean_progress.setVisible(True)
+        self.clean_progress.setValue(0)
+        self.status_label.setText("Cleaning fans...")
+
+        if self.controller.is_service_running():
+            # the service owns the fans: ask it and watch the state file
+            FanCleaner.request()
+            self.clean_requested_at = time.time()
+            self.clean_watching = True
+            self.clean_poll_timer.start(500)
+            return
+
+        if hasattr(self, 'curve_timer'):
+            self.curve_timer.stop()
+        self.clean_thread = WorkerThread(self.cleaner.run)
+        self.clean_thread.progress.connect(self.clean_progress.setValue)
+        self.clean_thread.finished.connect(self.on_cleaning_finished)
+        self.clean_thread.start()
+        self.clean_poll_timer.start(500)
+
+    def stop_cleaning(self):
+        if self.cleaner.is_running():
+            FanCleaner.request_stop()
+            self.clean_status_lbl.setText("Stopping…")
+        self.clean_stop_btn.setEnabled(False)
+
+    def on_cleaning_finished(self, result):
+        ok, msg = result
+        self.clean_thread = None
+        self.clean_poll_timer.stop()
+        self.clean_watching = False
+        self.status_label.setText(msg)
+        self.refresh_cleaning_state()
+        # give the fans back to whatever mode the user had
+        self.apply_fan_mode()
+        if not ok:
+            QMessageBox.warning(self, "Fan Cleaning", msg)
+
     def init_about_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -1078,10 +1378,13 @@ class MainWindow(QMainWindow):
     def show_driver(self): self.show_page(self.stack.widget(3), "Driver Management")
     def show_options(self): self.show_page(self.stack.widget(4), "Options")
     def show_about(self): self.show_page(self.stack.widget(5), "About")
+    def show_cleaning(self):
+        self.refresh_cleaning_support()
+        self.show_page(self.cleaning_page, "Fan Cleaning")
 
     # Core Logic
     def update_status(self, estimate=None):
-        rpm = self.controller.get_fan_speed()
+        rpm, reverse = self.controller.get_fan_state(1)
         if estimate is None:
             estimate = self.last_estimate
         if estimate is None:
@@ -1096,16 +1399,19 @@ class MainWindow(QMainWindow):
             tip += f"\nPackage sustained (min over spike window): {estimate['sustained']}°C"
         tip += "\nThe fan curve is applied to the control temperature. Click for per-core temperatures."
         
-        self.rpm_label.setText(f"{rpm} RPM")
+        self.rpm_label.setText(f"{rpm} RPM" + (" ↺" if reverse else ""))
+        self.rpm_label.setToolTip("Fans spinning backwards (fan cleaning)" if reverse else "")
         self.temp_label.setText(f"{int(round(estimate['control']))}°C")
         self.temp_label.setToolTip(tip)
         
         self.check_driver_status()
+        if hasattr(self, "cleaning_page"):
+            self.refresh_cleaning_state()
 
     def check_driver_status(self):
         # Don't overwrite status if we are in the middle of an operation
         current_text = self.status_label.text()
-        if any(x in current_text for x in ["Installing", "Restoring", "Calibrating", "Stress"]):
+        if any(x in current_text for x in ["Installing", "Restoring", "Calibrating", "Stress", "Cleaning"]):
             return
 
         # Refresh paths if driver might have just been loaded
@@ -1571,6 +1877,11 @@ class MainWindow(QMainWindow):
         self.svc_timer.stop()
         if hasattr(self, 'curve_timer'):
             self.curve_timer.stop()
+        if hasattr(self, 'clean_poll_timer'):
+            self.clean_poll_timer.stop()
+        if getattr(self, 'clean_thread', None) is not None:
+            FanCleaner.request_stop()
+            self.clean_thread.wait(15000)
         event.accept()
 
 if __name__ == "__main__":
